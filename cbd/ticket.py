@@ -113,6 +113,7 @@ class TicketDriver:
                 for c in self.st["checkboxes"]:
                     if c.get("phase") in ("done", "deferred"):
                         continue
+                    self.reload_config(c)
                     self.process_checkbox(c)
                 self.finish_ticket()
                 return
@@ -292,6 +293,32 @@ class TicketDriver:
         path = os.path.join(work, f"{kind}-brief.md")
         write_text(path, text)
         return path
+
+    # ---- config edits take effect at checkbox boundaries
+    def reload_config(self, c):
+        """Re-read config.json before checkbox c starts; a checkbox already under way keeps its sessions. Sessions the
+        new config drops from not-yet-started checkboxes are closed, new ones are registered."""
+        if c.get("dispatch"):
+            return
+        before = self.cfg.raw
+        error = self.cfg.reload()
+        if error:
+            self.log(f"경고: config.json 다시 읽기 실패 — 직전 설정 유지: {error}")
+            return
+        if self.cfg.raw == before:
+            return
+        self.log(f"#{c['index']} 부터 바뀐 config.json 적용")
+        boxes = {b.index: b for b in self._boxes()}
+        kinds = {(r["box"], r["kind"]) for r in B.ticket_sessions(self.cfg, self.t, list(boxes.values()))}
+        for box in self.st["checkboxes"]:
+            if box.get("phase") in ("done", "deferred") or box.get("dispatch") or box["index"] not in boxes:
+                continue
+            box["kind"] = B.kind(self.cfg, self.t, boxes[box["index"]])
+            for kind in [k for k in (box.get("tasks") or {}) if (box["index"], k) not in kinds]:
+                orca.task_update(self.st["run_id"], box["tasks"].pop(kind), "completed",
+                                 "cbd: 건너뜀 — config.json 변경으로 빠진 세션")
+        self.save()
+        self.precreate_tasks()
 
     # ---- checkboxes
     def process_checkbox(self, c):

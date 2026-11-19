@@ -41,14 +41,30 @@ class Config:
         self.home = os.path.expanduser(home or os.environ.get("CBD_HOME") or "~/.checkbox-driver")
         self.dir = os.path.join(self.home, key)
         self.path = os.path.join(self.dir, "config.json")
+        try:
+            self.raw = self._read()
+        except ValueError as e:
+            raise SystemExit(f"{e} — 먼저 cbd {key} init" if "JSON" in str(e) else str(e))
+
+    def _read(self):
         raw = read_json(self.path)
         if raw is None:
-            raise SystemExit(f"{self.path} 없음 또는 JSON 오류 — 먼저 cbd {key} init")
-        self.raw = {**DEFAULTS, **raw}
-        missing = [k for k in REQUIRED if not self.raw.get(k)]
+            raise ValueError(f"{self.path} 없음 또는 JSON 오류")
+        merged = {**DEFAULTS, **raw}
+        missing = [k for k in REQUIRED if not merged.get(k)]
         if missing:
-            raise SystemExit(f"{self.path} 에 {', '.join(missing)} 가 없다")
-        self.raw["design_root"] = os.path.expanduser(self.raw["design_root"])
+            raise ValueError(f"{self.path} 에 {', '.join(missing)} 가 없다")
+        merged["design_root"] = os.path.expanduser(merged["design_root"])
+        return merged
+
+    def reload(self):
+        """Re-read config.json in place, so a long-running scheduler or driver sees edits made after it started.
+        A broken file keeps the current settings; the error text is returned (None when the reload took)."""
+        try:
+            self.raw = self._read()
+        except ValueError as e:
+            return str(e)
+        return None
 
     def __getitem__(self, k):
         return self.raw[k]

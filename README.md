@@ -32,6 +32,8 @@ status: active
   티켓은 사람이 검증을 마치고 `start_waived` 에 적을 때까지 기다린다.
 - 설정·상태: `~/.checkbox-driver/<키>/` (`CBD_HOME` 으로 바꿈) — `config.json`, `state/<티켓>.json`, `state/plan.json`(에이전트
   대시보드 `external_plans` 계약), `state/state.md`, `state/replies/<run>/`, `logs/`, `work/<티켓>/<NN>/`(브리프·초안·findings·판정문).
+- `config.json` 은 재기동 없이 반영된다: 스케줄러는 매 회차, 티켓 드라이버는 체크박스 경계마다 다시 읽는다(진행 중 체크박스의 세션은
+  그대로, JSON 오류면 직전 설정을 유지하고 경고 로그).
 
 ## 규칙 (방식 문서와 같은 것)
 

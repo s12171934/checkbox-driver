@@ -255,6 +255,56 @@ class SchedulerTest(Env):
         self.assertEqual([a["kind"] for a in self.alerts()], ["restart_limit"])
 
 
+class ConfigReloadTest(Env):
+    def schedule_two_passes(self, between):
+        """cmd_schedule for two passes; `between` runs in the sleep after the first. Returns start_waived per pass."""
+        from cbd import cli
+        seen, sleeps = [], []
+
+        def record(cfg, design, store, **kw):
+            seen.append(dict(cfg["start_waived"]))
+            return []
+
+        def sleep(sec):
+            sleeps.append(sec)
+            if len(sleeps) == 1:
+                between()
+            else:
+                raise StopIteration
+
+        args = mock.Mock(key="ex", json=False, once=False, interval=1, coordinator_session=None)
+        with mock.patch.dict(os.environ, {"CBD_HOME": self.home}), \
+                mock.patch("cbd.cli.schedule_pass", side_effect=record), \
+                mock.patch("cbd.cli.time.sleep", side_effect=sleep), \
+                mock.patch("sys.stdout"):
+            with self.assertRaises(StopIteration):
+                cli.cmd_schedule(args)
+        return seen
+
+    def test_scheduler_rereads_config_every_pass(self):
+        seen = self.schedule_two_passes(lambda: self.write_conf(start_waived={"D1": ["F3"]}))
+        self.assertEqual(seen, [{}, {"D1": ["F3"]}])
+
+    def test_broken_config_keeps_the_last_settings_and_the_loop_alive(self):
+        def corrupt():
+            with open(os.path.join(self.home, "ex", "config.json"), "w") as f:
+                f.write("{ not json")
+        self.write_conf(start_waived={"D1": ["F3"]})
+        seen = self.schedule_two_passes(corrupt)
+        self.assertEqual(seen, [{"D1": ["F3"]}, {"D1": ["F3"]}])
+        self.assertTrue(any("config.json" in e["text"] for e in self.store.events()))
+
+    def test_reload_in_place(self):
+        cfg = Config("ex", self.home)
+        self.write_conf(reviewers=[{"name": "codex", "agent": "codex", "model": "m2"}])
+        self.assertIsNone(cfg.reload())
+        self.assertEqual(cfg["reviewers"][0]["model"], "m2")
+        with open(cfg.path, "w") as f:
+            json.dump({**self.conf, "repos": {}}, f)
+        self.assertIn("repos", cfg.reload())
+        self.assertEqual(cfg["reviewers"][0]["model"], "m2")
+
+
 class LockTest(Env):
     def test_one_driver_per_ticket_and_dead_owner_takeover(self):
         a, b = TicketLock(self.store, "A1"), TicketLock(self.store, "A1")

@@ -292,6 +292,29 @@ class TicketTest(unittest.TestCase):
         self.assertEqual(fake.started[0], "A1#2 구현 claude")
         self.assertEqual(self.store.ticket("A1")["status"], "verified")
 
+    def test_config_change_applies_from_the_next_checkbox(self):
+        """Edited while #1 is implementing: #1 keeps its sessions, #2 gets the new reviewers and model."""
+        fake = FakeOrca(self.repo)
+        models, start = [], fake.worker_start
+        conf = json.loads(_read(self.cfg.path))
+
+        def worker_start(rid, tid, wt, agent, model, effort, title, **kw):
+            models.append((title, model))
+            if title == "A1#1 구현":
+                with open(self.cfg.path, "w") as f:
+                    json.dump({**conf, "reviewers": [{"name": "codex", "agent": "codex", "model": "m2"},
+                                                     {"name": "gemini", "agent": "gemini", "model": "g1"}]}, f)
+            return start(rid, tid, wt, agent, model, effort, title, **kw)
+
+        fake.worker_start = worker_start
+        self.assertEqual(self.drive(fake), 0, self.store.ticket("A1").get("exceptions"))
+        reviews = [m for m in models if "리뷰" in m[0]]
+        self.assertEqual(reviews, [("A1#1 리뷰 codex", "gpt-6.1-sol"), ("A1#1 리뷰 claude", "claude-opus-5-5"),
+                                   ("A1#2 리뷰 codex", "m2"), ("A1#2 리뷰 gemini", "g1")])
+        dropped = next(t for t, (k, _) in fake.titles.items() if k == "A1#2 리뷰 claude")
+        self.assertEqual(fake.tasks[dropped]["status"], "completed")  # the dropped reviewer's task is closed
+        self.assertEqual(self.store.ticket("A1")["status"], "verified")
+
     def test_question_from_full_check_record_is_saved(self):
         """`orca orchestration check --full --json` returns raw records: from_handle, payload as a JSON string."""
         record = {"id": "msg_q1", "run_id": "run_1", "delivery_contract": "current_delivery",

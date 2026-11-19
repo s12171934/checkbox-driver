@@ -215,6 +215,11 @@ def cmd_schedule(a):
     store.save_scheduler({"scheduler_terminal": os.environ.get("ORCA_TERMINAL_HANDLE", ""),
                           **({"coordinator_session": a.coordinator_session} if a.coordinator_session else {})})
     while True:
+        error = cfg.reload()  # config.json edits (start_waived, hold, reviewers, …) apply from the next pass
+        if error:
+            store.event(None, f"config.json 다시 읽기 실패 — 직전 설정 유지: {error}")
+            print(f"{now_iso()} 경고: config.json 다시 읽기 실패 — 직전 설정 유지: {error}", flush=True,
+                  file=sys.stderr if a.json else sys.stdout)
         try:
             design = Design(cfg["design_root"], cfg["tc_pattern"])  # the design may gain checkboxes between passes
             if a.json:
