@@ -7,11 +7,13 @@ Orca facts the driver relies on (CLI 1.4.x):
 - `worker_done` is the only completion signal; heartbeats are not completion.
 - An accepted worker_done schedules a release of the worker terminal about 2 minutes later unless the worker was
   started with --keep-open — the implementing terminal is kept open so the judge can run in it.
+- A terminal still held by a finished dispatch takes a new task only through `worker-start --task --terminal`
+  (with --worktree of that terminal); `dispatch --to <terminal>` is refused with invalid_argument.
+- `task-update --status failed` then `worker-start --task --retry-of <dispatch>` reopens a failed task.
 """
 
 import json
 import subprocess
-import time
 
 from cbd.util import DriverError
 
@@ -38,6 +40,27 @@ class OrcaError(DriverError):
     def __init__(self, code, message):
         super().__init__("연결 불명", message)
         self.code = code
+
+
+# How the driver answers an Orca error:
+# (a) transient — Orca gave no definite refusal (timeout, unparsable output, a code not listed below, or a refusal that
+#     names a passing state): the ticket driver re-enters the same step after 60/120/240 s and blocks only after that;
+# (b) an alternative path exists — reusing a terminal refused: a new session at once (TicketDriver.start_judge);
+# (c) a person must decide — verification, rebase conflict, approval, worker question: these are not Orca errors and
+#     block or wait at once.
+PERMANENT_CODES = frozenset({"invalid_argument", "task_not_startable", "not_found", "permission_denied",
+                             "unauthenticated", "unauthorized", "forbidden"})
+TRANSIENT_HINTS = ("timed out", "timeout", "temporarily", "try again", "not ready", "release runs", "releasing",
+                   "econnrefused", "connection reset")
+
+
+def transient(e):
+    """True for class (a) above."""
+    if not isinstance(e, DriverError) or e.kind != "연결 불명":
+        return False
+    if getattr(e, "code", "") not in PERMANENT_CODES:
+        return True
+    return any(h in e.message.lower() for h in TRANSIENT_HINTS)
 
 
 def find(node, key):
@@ -162,36 +185,32 @@ def task_update(run_id, task_id, status, result=""):
     call(*args)
 
 
-def worker_start(run_id, task_id, worktree_path, agent, model, effort, title, keep_open=False, retry_of=None):
-    """Start a supervised worker for a ready task. Retries with backoff 0/60/120/240 s on transient errors."""
-    args = ["orchestration", "worker-start", "--run", run_id, "--task", task_id, "--worktree", f"path:{worktree_path}",
-            "--agent", agent, "--display-name", title]
-    if model:
-        args += ["--model", model]
-    if effort:
-        args += ["--effort", effort]
+def worker_start(run_id, task_id, worktree_path, agent, model, effort, title, keep_open=False, retry_of=None,
+                 terminal=None):
+    """Start a supervised worker for a ready (or failed, with retry_of) task — one call, no retry: the ticket driver
+    decides what an error means (transient). `terminal` reuses a live terminal held by a finished dispatch; Orca then
+    refuses --agent/--model/--effort and needs --worktree of that terminal."""
+    args = ["orchestration", "worker-start", "--run", run_id, "--task", task_id, "--worktree", f"path:{worktree_path}"]
+    if terminal:
+        args += ["--terminal", terminal]
+    else:
+        args += ["--agent", agent, "--display-name", title]
+        if model:
+            args += ["--model", model]
+        if effort:
+            args += ["--effort", effort]
     if keep_open:
         args += ["--keep-open"]
     if retry_of:
         args += ["--retry-of", retry_of]
-    last = None
-    for delay in (0, 60, 120, 240):
-        time.sleep(delay)
-        try:
-            res = call(*args, timeout=300)
-            return {"dispatch": find(res, "dispatchId") or find(res, "id"),
-                    "handle": find(res, "handle") or find(res, "terminal") or find(res, "agentTerminalHandle")}
-        except OrcaError as e:
-            if e.code in ("task_not_startable",):
-                raise
-            last = e
-    raise DriverError("정체", f"워커 기동 실패: {title} — {last}")
+    res = call(*args, timeout=300)
+    return {"dispatch": find(res, "dispatchId") or find(res, "id"),
+            "handle": find(res, "handle") or find(res, "terminal") or find(res, "agentTerminalHandle")}
 
 
-def dispatch(run_id, task_id, handle):
-    """Hand a task to an existing terminal (the judge goes to the implementing terminal)."""
-    res = call("orchestration", "dispatch", "--run", run_id, "--task", task_id, "--to", handle, "--inject")
-    return find(res, "dispatchId") or find(res, "id")
+def worker_list(run_id):
+    """Worker records of the Run: dispatchId, taskId, state, liveness, terminal."""
+    return call("orchestration", "worker-list", "--run", run_id, "--limit", "100").get("workers") or []
 
 
 def worker_release(dispatch_id):

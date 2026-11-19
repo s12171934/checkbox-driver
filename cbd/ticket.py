@@ -10,6 +10,7 @@ status, not from the mailbox).
 import os
 import re
 import shlex
+import time
 
 from cbd import boxes as B
 from cbd import briefs, orca
@@ -20,6 +21,11 @@ from cbd.jira import Jira
 from cbd.select import base_for, repo_base
 from cbd.state import BLOCKED, BOX_WAITING, DONE_STATUSES, RUNNING, VERIFIED, TicketLock
 from cbd.util import DriverError, git, now_iso, now_ts, run, write_text
+
+
+RETRY_DELAYS = (60, 120, 240)  # transient Orca errors (orca.transient): the same step again, then blocked
+WORKER_RETRIES = 3              # a failed or lost worker is started again with --retry-of this many times
+WORKER_GONE = ("failed", "lost", "cancelled", "canceled", "abandoned", "stopped")
 
 
 class BoxWait(Exception):
@@ -39,6 +45,7 @@ class TicketDriver:
         self.gate = Gate(cfg, store, self.log)
         self.jira = Jira(cfg)
         self.handle = os.environ.get("ORCA_TERMINAL_HANDLE", "")
+        self.progress = 0  # bumped whenever a worker or checkbox finishes; resets the transient-retry count
 
     # ---- bookkeeping
     def log(self, text):
@@ -74,14 +81,7 @@ class TicketDriver:
             self.st.update(status=RUNNING, driver_terminal_handle=self.handle or self.st.get("driver_terminal_handle"),
                            pid=os.getpid())
             self.save()
-            self.start_ticket()
-            self.ensure_run()
-            self.precreate_tasks()
-            for c in self.st["checkboxes"]:
-                if c.get("phase") in ("done", "deferred"):
-                    continue
-                self.process_checkbox(c)
-            self.finish_ticket()
+            self.drive()
             return 0
         except BoxWait as w:
             self.st.update(status=BOX_WAITING, waiting_on=",".join(w.packages))
@@ -101,11 +101,41 @@ class TicketDriver:
             except Exception as e:  # the plan is a view; never hide the real outcome behind it
                 print(f"plan.json 갱신 실패: {e}")
 
+    def drive(self):
+        """Every step is resumable, so a transient Orca error re-enters the same step after 60/120/240 s; the ticket
+        blocks on the fourth failure in a row without progress, marked retryable for the scheduler's auto-resolve."""
+        failures, mark = 0, self.progress
+        while True:
+            try:
+                self.start_ticket()
+                self.ensure_run()
+                self.precreate_tasks()
+                for c in self.st["checkboxes"]:
+                    if c.get("phase") in ("done", "deferred"):
+                        continue
+                    self.process_checkbox(c)
+                self.finish_ticket()
+                return
+            except DriverError as e:
+                if not orca.transient(e):
+                    raise
+                if self.progress != mark:
+                    failures, mark = 0, self.progress
+                if failures >= len(RETRY_DELAYS):
+                    raise DriverError(e.kind, f"{len(RETRY_DELAYS)}회 재시도 후에도 실패 — {e.message}", retryable=True)
+                delay = RETRY_DELAYS[failures]
+                failures += 1
+                self.log(f"일시 오류 — {delay}초 뒤 같은 단계 재시도 {failures}/{len(RETRY_DELAYS)}: {e.message[:300]}")
+                time.sleep(delay)
+
     def block(self, e):
-        self.st.setdefault("exceptions", []).append({"kind": e.kind, "message": e.message, "at": now_iso()})
+        self.st.setdefault("exceptions", []).append({"kind": e.kind, "message": e.message, "at": now_iso(),
+                                                     "retryable": e.retryable})
         self.st["status"] = BLOCKED
         self.save()
         self.log(f"멈춤 [{e.kind}] {e.message}")
+        self.store.alert(self.pkg, "blocked", f"[{e.kind}] {e.message}", exception_kind=e.kind,
+                         retryable=e.retryable, terminal=self.handle)
         self.notify(f"{self.pkg} 멈춤 [{e.kind}] {e.message[:80]}")
 
     # ---- start
@@ -282,6 +312,7 @@ class TicketDriver:
             self.agent_box(c)
         c["phase"] = "done"
         c["finished_at"] = now_iso()
+        self.progress += 1
         self.save()
         try:
             self.jira.check_box(self.t.jira, c["title"])
@@ -349,7 +380,7 @@ class TicketDriver:
 
     # ---- agent checkbox: implement -> review x N -> judge
     def agent_box(self, c):
-        wt, rid = self.st["worktree"], self.st["run_id"]
+        wt = self.st["worktree"]
         work = self.work(c["index"])
         p = briefs.paths(work)
         done, disp = c.setdefault("done", {}), c.setdefault("dispatch", {})
@@ -358,11 +389,7 @@ class TicketDriver:
             if not disp.get("impl"):
                 c["notes"] = self.gate.wait([impl.get("pool", impl["agent"])], f"#{c['index']} 착수")
                 c["head_before"] = git(wt, "rev-parse", "HEAD")
-                w = orca.worker_start(rid, c["tasks"]["impl"], wt, impl["agent"], impl["model"], impl.get("effort"),
-                                      f"{self.pkg}#{c['index']} 구현", keep_open=True)
-                disp["impl"], c["impl_handle"] = w["dispatch"], w["handle"]
-                c["dispatched_at"] = now_iso()
-                self.save()
+                self.launch(c, "impl")
             self.wait_task(c, "impl")
         if run(["git", "-C", wt, "diff", "--cached", "--quiet"]).returncode == 0:
             raise DriverError("정체", f"{c['index']}번 구현이 스테이지를 남기지 않았다")
@@ -374,31 +401,68 @@ class TicketDriver:
             c.setdefault("notes", []).extend(self.gate.wait(sorted({r.get("pool", r["agent"]) for r in pending}),
                                                             f"#{c['index']} 리뷰"))
             for r in pending:
-                k = f"review-{r['name']}"
-                if not disp.get(k):
-                    w = orca.worker_start(rid, c["tasks"][k], wt, r["agent"], r["model"], r.get("effort"),
-                                          f"{self.pkg}#{c['index']} 리뷰 {r['name']}")
-                    disp[k] = w["dispatch"]
-                    self.save()
+                if not disp.get(f"review-{r['name']}"):
+                    self.launch(c, f"review-{r['name']}")
             for r in pending:
                 self.wait_task(c, f"review-{r['name']}", accept_file=briefs.findings_path(work, r["name"]))
         if not done.get("judge"):
             if not disp.get("judge"):
-                if c.get("impl_handle") in orca.live_handles():
-                    disp["judge"] = orca.dispatch(rid, c["tasks"]["judge"], c["impl_handle"])
-                else:
-                    self.log(f"#{c['index']} 구현 터미널이 닫혀 판정을 새 세션으로 띄운다")
-                    disp["judge"] = orca.worker_start(rid, c["tasks"]["judge"], wt, impl["agent"], impl["model"],
-                                                      impl.get("effort"), f"{self.pkg}#{c['index']} 판정")["dispatch"]
-                c["dispatched_at"] = now_iso()
-                self.save()
+                self.launch(c, "judge")
             self.wait_task(c, "judge")
         self.check_commit(c)
         for k, d in disp.items():
             if k != "judge" and d:
                 orca.worker_release(d)
-        if c.get("impl_handle"):  # kept open for the judge; the checkbox is over, so is its implementer (루프 10 종료)
+        if c.get("impl_handle"):  # kept open for the judge (which ran in it, or not); the checkbox is over (루프 10 종료)
             orca.terminal_close(c["impl_handle"])
+
+    def launch(self, c, kind, retry_of=None):
+        """Start the worker of `kind` (impl | review-<name> | judge) and record its dispatch."""
+        disp = c.setdefault("dispatch", {})
+        title = f"{self.pkg}#{c['index']}"
+        if kind == "impl":
+            impl = self.cfg["impl"]
+            w = self.start_worker(c, kind, impl, f"{title} 구현", keep_open=True, retry_of=retry_of)
+            c["impl_handle"] = w["handle"]
+        elif kind == "judge":
+            w = self.start_judge(c, retry_of)
+        else:
+            r = next(r for r in self.cfg["reviewers"] if f"review-{r['name']}" == kind)
+            w = self.start_worker(c, kind, r, f"{title} 리뷰 {r['name']}", retry_of=retry_of)
+        disp[kind] = w["dispatch"]
+        c["dispatched_at"] = now_iso()
+        self.save()
+
+    def start_judge(self, c, retry_of=None):
+        """The judge runs in the implementing terminal (it remembers the work); a new session judges from the files."""
+        impl, h = self.cfg["impl"], c.get("impl_handle")
+        title = f"{self.pkg}#{c['index']} 판정"
+        if h and h in orca.live_handles():
+            try:
+                return self.start_worker(c, "judge", impl, title, retry_of=retry_of, terminal=h)
+            except DriverError as e:  # (b) any refusal to reuse the terminal has the new-session path
+                self.log(f"#{c['index']} 구현 터미널 {h} 재사용 실패 — 새 세션으로 판정: {e.message[:300]}")
+        else:
+            self.log(f"#{c['index']} 구현 터미널이 닫혀 판정을 새 세션으로 띄운다")
+        return self.start_worker(c, "judge", impl, title, retry_of=retry_of)
+
+    def start_worker(self, c, kind, agent, title, keep_open=False, retry_of=None, terminal=None):
+        """worker-start, unless an earlier start whose answer was lost already dispatched the task: starting it
+        again would put two workers on one worktree."""
+        rid, tid = self.st["run_id"], c["tasks"][kind]
+        if orca.task_list(rid).get(tid, {}).get("status") in ("dispatched", "completed"):
+            w = self.current_worker(tid)
+            if w:
+                self.log(f"#{c['index']} {kind} 는 이미 기동돼 있다 — {w.get('dispatchId')} 를 이어 받는다")
+                return {"dispatch": w.get("dispatchId"), "handle": w.get("terminal")}
+        return orca.worker_start(rid, tid, self.st["worktree"], agent["agent"], agent.get("model"), agent.get("effort"),
+                                 title, keep_open=keep_open, retry_of=retry_of, terminal=terminal)
+
+    def current_worker(self, tid, dispatch=None):
+        rows = [w for w in orca.worker_list(self.st["run_id"]) if w.get("taskId") == tid]
+        if dispatch:
+            return next((w for w in rows if w.get("dispatchId") == dispatch), None)
+        return next((w for w in rows if w.get("state") not in WORKER_GONE), None)
 
     def check_commit(self, c):
         wt = self.st["worktree"]
@@ -415,7 +479,8 @@ class TicketDriver:
 
     def wait_task(self, c, kind, accept_file=None):
         """Wait until the task of `kind` completes. Mail is the wake-up; the task status is the truth, so a done
-        signal received before a restart is not lost. Questions are saved to files and answered from files."""
+        signal received before a restart is not lost. Questions are saved to files and answered from files.
+        A failed task or a worker gone without worker_done is started again with --retry-of, WORKER_RETRIES times."""
         rid, tid = self.st["run_id"], c["tasks"][kind]
         started = now_ts()
         while True:
@@ -423,19 +488,44 @@ class TicketDriver:
             status = task.get("status")
             if status == "completed":
                 c.setdefault("done", {})[kind] = now_iso()
+                self.progress += 1
                 self.save()
                 return
-            if status == "failed":
+            why = f"태스크 실패: {str(task.get('result', ''))[:200]}" if status == "failed" else self.worker_gone(c, kind)
+            if why:
                 if accept_file and os.path.exists(accept_file):
                     self.log(f"#{c['index']} {kind} 가 실패로 끝났지만 결과 파일이 있어 수용 ({accept_file})")
                     c.setdefault("done", {})[kind] = now_iso()
+                    self.progress += 1
                     self.save()
                     return
-                kind_name = "리뷰어 불가" if kind.startswith("review") else "정체"
-                raise DriverError(kind_name, f"#{c['index']} {kind} 태스크 실패: {str(task.get('result', ''))[:200]}")
+                retries = c.setdefault("retries", {})
+                if retries.get(kind, 0) >= WORKER_RETRIES:
+                    kind_name = "리뷰어 불가" if kind.startswith("review") else "정체"
+                    raise DriverError(kind_name, f"#{c['index']} {kind} {WORKER_RETRIES}회 재시도 후에도 {why}")
+                retries[kind] = retries.get(kind, 0) + 1
+                prev = c["dispatch"].get(kind)
+                if status != "failed":  # Orca reopens only a failed task with --retry-of
+                    orca.task_update(rid, tid, "failed", f"cbd: {why}")
+                if kind == "impl" and c.get("impl_handle"):
+                    orca.terminal_close(c["impl_handle"])
+                self.log(f"#{c['index']} {kind} 워커 재시도 {retries[kind]}/{WORKER_RETRIES} (--retry-of {prev}) — {why}")
+                self.launch(c, kind, retry_of=prev)
+                started = now_ts()
+                continue
             if now_ts() - started > int(self.cfg["quiet_limit_sec"]) and not self._has_open_question():
                 raise DriverError("정체", f"#{c['index']} {kind} 가 {int(self.cfg['quiet_limit_sec']) // 60}분 동안 끝나지 않았다")
             self.pump(rid)
+
+    def worker_gone(self, c, kind):
+        """Why the worker of a not-yet-finished task is gone (exited or lost without worker_done), or None."""
+        d = c.get("dispatch", {}).get(kind)
+        w = self.current_worker(c["tasks"][kind], d) if d else None
+        if not w or w.get("state") == "succeeded":
+            return None
+        if w.get("state") in WORKER_GONE or w.get("liveness") in ("exited", "lost"):
+            return f"워커 {d} 가 worker_done 없이 끝났다 (state {w.get('state')}, liveness {w.get('liveness')})"
+        return None
 
     def _has_open_question(self):
         return any(not q.get("answered") for q in self.st.get("questions") or [])
@@ -451,6 +541,8 @@ class TicketDriver:
                 self.st.setdefault("questions", []).append({"msg_id": m["id"], "path": path, "at": now_iso()})
                 self.save()
                 self.log(f"질문 대기 — {path}")
+                self.store.alert(self.pkg, m["type"], (m["body"] or m["subject"]), question=path, msg_id=m["id"],
+                                 answer=os.path.join(d, f"{m['id']}.md"), worker=m["from"])
                 self.notify(f"{self.pkg} 워커 질문: {(m['body'] or m['subject'])[:60]}")
         d = self.store.reply_dir(rid)
         for q in self.st.get("questions") or []:

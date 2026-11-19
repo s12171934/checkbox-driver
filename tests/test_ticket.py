@@ -40,6 +40,9 @@ class FakeOrca:
         self.n = 0
         self.behaviour = behaviour or {}
         self.started = []
+        self.starts = []    # (task key, terminal, retry_of) per worker-start
+        self.workers = []   # worker-list rows
+        self.updates = []
 
     def run_create(self, objective):
         return "run_1"
@@ -63,9 +66,16 @@ class FakeOrca:
     def _work(self, spec):
         return os.path.dirname(spec)
 
-    def worker_start(self, rid, tid, wt, agent, model, effort, title, keep_open=False, retry_of=None):
+    def worker_start(self, rid, tid, wt, agent, model, effort, title, keep_open=False, retry_of=None, terminal=None):
         key, spec = self.titles[tid]
+        if terminal and self.behaviour.get("reuse") == "refused":
+            raise orca.OrcaError("invalid_argument", f"Terminal {terminal} is still held by finished Dispatch ctx_x.")
         self.started.append(key)
+        self.starts.append((key, terminal, retry_of))
+        d = f"d_{tid}" + (f"_r{len(self.starts)}" if retry_of else "")
+        self.workers.insert(0, {"dispatchId": d, "taskId": tid, "state": "succeeded", "liveness": "exited",
+                                "terminal": terminal or f"h_{tid}"})
+        self.tasks[tid]["status"] = "dispatched"
         work = self._work(spec)
         if "구현" in key:
             n = key.split("#")[1].split()[0]
@@ -84,17 +94,19 @@ class FakeOrca:
             self.tasks[tid]["status"] = "failed" if self.behaviour.get("review", "").startswith("fail") else "completed"
         else:
             self._judge(tid, wt, work)
-        return {"dispatch": f"d_{tid}", "handle": f"h_{tid}"}
+        return {"dispatch": d, "handle": terminal or f"h_{tid}"}
+
+    def worker_list(self, rid):
+        return self.workers
+
+    def task_update(self, rid, tid, status, result=""):
+        self.updates.append((tid, status))
+        self.tasks[tid]["status"] = status
 
     def _judge(self, tid, wt, work):
         title = _read(os.path.join(work, "commit-message.md")).strip()
         sh(wt, "git", "commit", "-q", "-m", title)
         self.tasks[tid]["status"] = "completed"
-
-    def dispatch(self, rid, tid, handle):
-        key, spec = self.titles[tid]
-        self._judge(tid, self.repo, self._work(spec))
-        return f"d_{tid}"
 
     def live_handles(self):
         return frozenset(f"h_{t}" for t in self.tasks)
@@ -156,12 +168,20 @@ class TicketTest(unittest.TestCase):
         shutil.rmtree(self.home)
 
     def drive(self, fake, pkg="A1"):
-        names = ["run_create", "run_use", "task_create", "task_list", "worker_start", "dispatch", "live_handles",
-                 "check_wait", "worker_release", "find_worktree", "worktree_create", "terminal_close", "repo_info",
-                 "worktrees"]
+        names = ["run_create", "run_use", "task_create", "task_list", "worker_start", "worker_list", "task_update",
+                 "live_handles", "check_wait", "worker_release", "find_worktree", "worktree_create", "terminal_close",
+                 "repo_info", "worktrees"]
+        self.sleeps = []
         with mock.patch.multiple(orca, **{n: getattr(fake, n) for n in names}), \
-                mock.patch("cbd.plan.git", return_value="deadbeef"):
+                mock.patch("cbd.plan.git", return_value="deadbeef"), \
+                mock.patch("cbd.ticket.time.sleep", side_effect=self.sleeps.append):
             return TicketDriver(self.cfg, self.design, self.store, pkg).run()
+
+    def alerts(self):
+        try:
+            return [json.loads(l) for l in _read(self.store.p("alerts.jsonl")).splitlines()]
+        except FileNotFoundError:
+            return []
 
     def test_whole_ticket(self):
         fake = FakeOrca(self.repo)
@@ -175,6 +195,9 @@ class TicketTest(unittest.TestCase):
         # 2 agent boxes x (impl + 2 reviews + judge) precreated, driver verify has no task
         self.assertEqual(len(fake.tasks), 8)
         self.assertEqual(fake.started[:3], ["A1#1 구현 claude", "A1#1 리뷰 codex", "A1#1 리뷰 claude"])
+        # the judge is started on the implementing terminal with worker-start --terminal, not dispatch --inject
+        impl_task = next(t for t, (k, _) in fake.titles.items() if k == "A1#1 구현 claude")
+        self.assertIn(("A1#1 판정 claude", f"h_{impl_task}", None), fake.starts)
         self.assertEqual(len(fake.closed), 2)  # each agent checkbox's implementing terminal is closed after its commit
         # the test commit's TC rows were handed to the implementer
         work = os.path.join(self.cfg.work_dir, "A1", "01")
@@ -304,6 +327,27 @@ class TicketTest(unittest.TestCase):
             w = orca.worker_start("run_1", "task_1", "/wt", "claude", "m", "high", "t")
         self.assertEqual(w, {"dispatch": "ctx_9", "handle": "term_9"})
 
+    def test_worker_start_on_a_terminal_names_its_worktree_and_no_model(self):
+        with mock.patch("cbd.orca.call", return_value={"dispatchId": "ctx_9", "terminal": "term_1"}) as call:
+            orca.worker_start("run_1", "task_1", "/wt", "claude", "m", "high", "t", terminal="term_1", retry_of="ctx_0")
+        args = list(call.call_args.args)
+        self.assertEqual(args[:6], ["orchestration", "worker-start", "--run", "run_1", "--task", "task_1"])
+        self.assertIn("--terminal", args)
+        self.assertEqual(args[args.index("--worktree") + 1], "path:/wt")
+        self.assertEqual(args[args.index("--retry-of") + 1], "ctx_0")
+        for flag in ("--agent", "--model", "--effort", "--display-name"):
+            self.assertNotIn(flag, args)
+
+    def test_error_classes(self):
+        T = orca.transient
+        self.assertTrue(T(orca.DriverError("연결 불명", "orca worker-start 응답 없음 (300s)")))
+        self.assertTrue(T(orca.OrcaError("runtime_error", "Dependency task x must belong to run y")))
+        self.assertTrue(T(orca.OrcaError("invalid_argument", "the start is refused while the release runs")))
+        self.assertFalse(T(orca.OrcaError("invalid_argument", "Terminal t is still held by finished Dispatch ctx")))
+        self.assertFalse(T(orca.OrcaError("task_not_startable", "deps unfinished")))
+        self.assertFalse(T(orca.DriverError("검증 실패", "verify 실패")))
+        self.assertFalse(T(orca.DriverError("환경", "orca CLI 가 PATH 에 없다")))
+
     def test_failed_reviewer_with_findings_file_is_accepted(self):
         self.assertEqual(self.drive(FakeOrca(self.repo, {"review": "fail-with-file"})), 0)
         self.assertEqual(self.store.ticket("A1")["status"], "verified")
@@ -329,15 +373,16 @@ class TicketTest(unittest.TestCase):
 
     def test_restart_resumes_after_done_signal(self):
         fake = FakeOrca(self.repo)
-        orig = fake.dispatch
+        orig = fake.worker_start
         calls = {"n": 0}
 
-        def crash_once(rid, tid, handle):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                raise KeyboardInterrupt  # the driver dies while the judge is dispatched
-            return orig(rid, tid, handle)
-        fake.dispatch = crash_once
+        def crash_once(rid, tid, *a, **k):
+            if "판정" in fake.titles[tid][0]:
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise KeyboardInterrupt  # the driver dies while the judge is dispatched
+            return orig(rid, tid, *a, **k)
+        fake.worker_start = crash_once
         with self.assertRaises(KeyboardInterrupt):
             self.drive(fake)
         st = self.store.ticket("A1")
@@ -348,6 +393,143 @@ class TicketTest(unittest.TestCase):
         # no implementer or reviewer of box 1 was started again
         self.assertNotIn("A1#1 구현 claude", fake.started[started:])
         self.assertEqual(self.store.ticket("A1")["status"], "verified")
+
+    # ---- judge on the implementing terminal, and its fallback
+    def test_judge_falls_back_to_a_new_session_when_terminal_reuse_is_refused(self):
+        fake = FakeOrca(self.repo, {"reuse": "refused"})
+        self.assertEqual(self.drive(fake), 0, self.store.ticket("A1").get("exceptions"))
+        self.assertIn(("A1#1 판정 claude", None, None), fake.starts)
+        log = _read(self.cfg.p("logs", "ticket-A1.log"))
+        self.assertIn("재사용 실패 — 새 세션으로 판정", log)
+        self.assertIn("still held by finished Dispatch", log)
+
+    # ---- transient Orca errors: the same step again, blocked only after three retries
+    def test_transient_error_retries_the_same_step(self):
+        fake = FakeOrca(self.repo)
+        orig, calls = fake.task_list, {"n": 0}
+
+        def flaky(rid):
+            calls["n"] += 1
+            if calls["n"] in (3, 4):
+                raise orca.DriverError("연결 불명", "orca orchestration task-list 응답 없음 (120s)")
+            return orig(rid)
+        fake.task_list = flaky
+        self.assertEqual(self.drive(fake), 0, self.store.ticket("A1").get("exceptions"))
+        self.assertEqual(self.sleeps, [60, 120])
+        self.assertEqual(self.store.ticket("A1")["status"], "verified")
+        self.assertEqual(fake.started.count("A1#1 구현 claude"), 1)
+
+    def test_transient_error_blocks_retryable_after_three_retries_and_alerts(self):
+        fake = FakeOrca(self.repo)
+        fake.run_create = mock.Mock(side_effect=orca.OrcaError("runtime_unavailable", "Orca runtime is restarting"))
+        self.assertEqual(self.drive(fake), 2)
+        self.assertEqual(self.sleeps, [60, 120, 240])
+        exc = self.store.ticket("A1")["exceptions"][-1]
+        self.assertEqual((exc["kind"], exc["retryable"]), ("연결 불명", True))
+        self.assertIn("3회 재시도 후에도 실패", exc["message"])
+        [alert] = self.alerts()
+        self.assertEqual((alert["package"], alert["kind"], alert["retryable"]), ("A1", "blocked", True))
+        self.assertIn("Orca runtime is restarting", alert["summary"])
+
+    def test_definite_orca_refusal_blocks_at_once(self):
+        fake = FakeOrca(self.repo)
+        fake.run_create = mock.Mock(side_effect=orca.OrcaError("invalid_argument", "objective is required"))
+        self.assertEqual(self.drive(fake), 2)
+        self.assertEqual(self.sleeps, [])
+        self.assertFalse(self.store.ticket("A1")["exceptions"][-1]["retryable"])
+
+    def test_a_start_whose_answer_was_lost_is_not_started_twice(self):
+        fake = FakeOrca(self.repo)
+        orig, lost = fake.worker_start, {"n": 0}
+
+        def started_but_no_answer(rid, tid, *a, **k):
+            r = orig(rid, tid, *a, **k)
+            if fake.titles[tid][0] == "A1#1 리뷰 codex" and not lost["n"]:
+                lost["n"] += 1
+                raise orca.DriverError("연결 불명", "orca orchestration worker-start 응답 없음 (300s)")
+            return r
+        fake.worker_start = started_but_no_answer
+        self.assertEqual(self.drive(fake), 0, self.store.ticket("A1").get("exceptions"))
+        self.assertEqual(fake.started.count("A1#1 리뷰 codex"), 1)
+        self.assertEqual(self.sleeps, [60])
+
+    # ---- failed or lost workers: --retry-of, then blocked
+    def test_failed_worker_is_started_again_with_retry_of(self):
+        fake = FakeOrca(self.repo)
+        orig, failed = fake.worker_start, {"n": 0}
+
+        def impl_fails_once(rid, tid, *a, **k):
+            if fake.titles[tid][0] == "A1#1 구현 claude" and not failed["n"]:
+                failed["n"] += 1
+                fake.started.append("A1#1 구현 claude")
+                fake.workers.insert(0, {"dispatchId": "d_bad", "taskId": tid, "state": "failed", "liveness": "exited"})
+                fake.tasks[tid]["status"] = "failed"
+                return {"dispatch": "d_bad", "handle": "h_bad"}
+            return orig(rid, tid, *a, **k)
+        fake.worker_start = impl_fails_once
+        self.assertEqual(self.drive(fake), 0, self.store.ticket("A1").get("exceptions"))
+        retry = [s for s in fake.starts if s[0] == "A1#1 구현 claude"]
+        self.assertEqual(retry, [("A1#1 구현 claude", None, "d_bad")])
+        self.assertIn("h_bad", fake.closed)  # the failed implementer's kept-open terminal is closed
+        self.assertEqual(self.store.ticket("A1")["checkboxes"][0]["retries"], {"impl": 1})
+
+    def test_lost_worker_is_failed_and_retried(self):
+        fake = FakeOrca(self.repo)
+        orig, lost = fake.worker_start, {"n": 0}
+
+        def impl_lost_once(rid, tid, *a, **k):
+            if fake.titles[tid][0] == "A1#1 구현 claude" and not lost["n"]:
+                lost["n"] += 1
+                fake.workers.insert(0, {"dispatchId": "d_lost", "taskId": tid, "state": "running", "liveness": "exited"})
+                fake.tasks[tid]["status"] = "dispatched"
+                return {"dispatch": "d_lost", "handle": "h_lost"}
+            return orig(rid, tid, *a, **k)
+        fake.worker_start = impl_lost_once
+        self.assertEqual(self.drive(fake), 0, self.store.ticket("A1").get("exceptions"))
+        impl_task = next(t for t, (k, _) in fake.titles.items() if k == "A1#1 구현 claude")
+        self.assertIn((impl_task, "failed"), fake.updates)
+        self.assertIn(("A1#1 구현 claude", None, "d_lost"), fake.starts)
+
+    def test_worker_failing_every_time_blocks_after_three_retries(self):
+        fake = FakeOrca(self.repo)
+
+        def always_fails(rid, tid, *a, retry_of=None, **k):
+            fake.starts.append((fake.titles[tid][0], None, retry_of))
+            fake.tasks[tid]["status"] = "failed"
+            d = f"d_{len(fake.starts)}"
+            fake.workers.insert(0, {"dispatchId": d, "taskId": tid, "state": "failed", "liveness": "exited"})
+            return {"dispatch": d, "handle": f"h_{len(fake.starts)}"}
+        fake.worker_start = always_fails
+        self.assertEqual(self.drive(fake), 2)
+        self.assertEqual([s[2] for s in fake.starts], [None, "d_1", "d_2", "d_3"])
+        exc = self.store.ticket("A1")["exceptions"][-1]
+        self.assertEqual(exc["kind"], "정체")
+        self.assertIn("3회 재시도 후에도", exc["message"])
+        self.assertEqual(self.alerts()[-1]["kind"], "blocked")
+
+    # ---- alerts
+    def test_worker_question_is_alerted(self):
+        record = {"id": "msg_q1", "from_handle": "dispatch:ctx_w1", "subject": "Question", "type": "question",
+                  "body": "키가 없다 — 어떻게 할까?", "payload": json.dumps({"taskId": "task_7"})}
+        self.store.save({"package": "A1", "status": "running", "run_id": "run_1", "checkboxes": []})
+        driver = TicketDriver(self.cfg, self.design, self.store, "A1")
+        with mock.patch("cbd.orca.call", return_value={"messages": [record]}):
+            driver.pump("run_1")
+        [alert] = self.alerts()
+        self.assertEqual((alert["kind"], alert["msg_id"], alert["worker"]), ("question", "msg_q1", "ctx_w1"))
+        self.assertTrue(alert["answer"].endswith("msg_q1.md"))
+        self.assertIn("키가 없다", alert["summary"])
+
+    def test_alerts_can_be_turned_off(self):
+        conf = json.loads(_read(self.cfg.path))
+        with open(self.cfg.path, "w") as f:
+            json.dump({**conf, "alerts": False}, f)
+        self.cfg = Config("ex", self.home)
+        self.store = Store(self.cfg)
+        fake = FakeOrca(self.repo)
+        fake.run_create = mock.Mock(side_effect=orca.OrcaError("invalid_argument", "x"))
+        self.assertEqual(self.drive(fake), 2)
+        self.assertEqual(self.alerts(), [])
 
     def test_verify_waits_for_chain_previous(self):
         sh(self.repo, "git", "checkout", "-q", "-b", "EX-1-A1-model")

@@ -25,7 +25,7 @@ from cbd import plan as P
 from cbd.config import Config
 from cbd.design import Design
 from cbd.select import select
-from cbd.state import ACTIVE_STATUSES, BLOCKED, DONE_STATUSES, PLANNED, STARTED, Store, driver_alive
+from cbd.state import ACTIVE_STATUSES, BLOCKED, DONE_STATUSES, PLANNED, STARTED, Store, driver_alive, seconds_since
 from cbd.util import DriverError, now_iso, write_json
 
 CBD = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "bin", "cbd"))
@@ -152,10 +152,42 @@ def launch(cfg, store, pkg, restart=False):
     return handle
 
 
+def auto_resolve(cfg, store, states):
+    """Reopen tickets whose stop is retryable (a transient Orca error that outlived the driver's own retries) once it is
+    `after_sec` old, at most `max` times per ticket; any other stop waits for a person."""
+    rule = cfg.get("auto_resolve") or {}
+    if not rule:
+        return
+    for pkg, st in states.items():
+        open_exc = [e for e in st.get("exceptions") or [] if not e.get("resolved")]
+        if st.get("status") != BLOCKED or not open_exc or not all(e.get("retryable") for e in open_exc):
+            continue
+        done = int(st.get("auto_resolves", 0))
+        if done >= int(rule.get("max", 3)) or seconds_since(open_exc[-1].get("at")) < int(rule.get("after_sec", 900)):
+            continue
+        st["auto_resolves"] = done + 1
+        store.resolve(st)
+        text = f"자동 재개 {done + 1}/{rule.get('max', 3)} — [{open_exc[-1]['kind']}] {open_exc[-1]['message'][:200]}"
+        store.event(pkg, text)
+        store.alert(pkg, "auto_resolved", text)
+
+
+def alert_restart_limit(cfg, store, states, alive):
+    """A dead driver past max_restarts is not relaunched; say so once instead of sitting silent."""
+    for pkg, st in states.items():
+        if (st.get("status") in ACTIVE_STATUSES and int(st.get("restarts", 0)) >= int(cfg["max_restarts"])
+                and not st.get("restart_limit_alerted") and not driver_alive({"package": pkg, **st}, alive)):
+            st["restart_limit_alerted"] = now_iso()
+            store.save(st)
+            store.alert(pkg, "restart_limit", f"드라이버 재기동 {cfg['max_restarts']}회 초과 — 원인 확인 뒤 cbd {cfg.key} resolve {pkg}")
+
+
 def schedule_pass(cfg, design, store, forced=(), report=None):
     """One scheduler round. `report(candidate_dict)` gets every candidate, selected = launched in this round."""
+    auto_resolve(cfg, store, store.all(design.order))
     states = store.all(design.order)
     alive = orca.live_handles()
+    alert_restart_limit(cfg, store, states, alive)
     launched = []
     for c in select(design, states, cfg, alive, forced=forced):
         row = c.as_dict()
@@ -230,13 +262,7 @@ def cmd_approve(a):
 def cmd_resolve(a):
     cfg, design, store = load(a.key)
     st = store.ticket(a.package)
-    for e in st.get("exceptions") or []:
-        if not e.get("resolved"):
-            e["resolved"] = now_iso()
-    if st.get("status") == BLOCKED:
-        st["status"] = STARTED if st.get("worktree") else PLANNED
-        st["launched_at"] = None
-    store.save(st)
+    store.resolve(st)
     store.event(a.package, "예외 해소 — 재기동 가능")
     print(f"{a.package}: {st['status']}")
 

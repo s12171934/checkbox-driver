@@ -1,7 +1,7 @@
 ---
 title: checkbox-driver
 created: 2026-11-10
-updated: 2026-11-11
+updated: 2026-11-19
 tags: [domain/인공지능, area/ai에이전트, type/설계, agent/claude-d8702234-c5f1-4d44-ab58-9d35f1de6a58]
 source: ai
 status: active
@@ -48,9 +48,41 @@ status: active
   재기동 때 옛 드라이버 터미널을 닫는다. 드라이버의 예상 밖 예외는 `멈춤 [드라이버 오류]` 로 남긴다.
 - 체크박스: `verify`(UI 티켓 제외)와 핀 `chore` 는 드라이버가 직접 커밋한다. 나머지는 구현 → 리뷰어 병렬(기본 Codex·Claude)
   → 같은 구현 터미널에서 판정·커밋. 커밋 제목 = `[Jira] <체크박스>`, 커밋 뒤 작업 트리가 깨끗해야 한다.
+  판정은 `worker-start --task <판정> --terminal <구현 터미널> --worktree path:<워크트리>` 로 구현 터미널에 넣는다(끝난
+  dispatch 가 잡은 터미널은 `dispatch --to` 로는 거부된다). 터미널이 닫혔거나 재사용이 어떤 이유로든 거부되면 그 사유를 로그에
+  남기고 새 세션(`impl` 모델)으로 판정한다. 체크박스가 커밋되면 구현 터미널을 닫는다.
 - 첫 verify 는 체인 앞 티켓이 verified 일 때만(verify 게이트). `box_prereqs` 는 체크박스 단위 선행.
 - 사용량 게이트 90%: 막히면 기다리고 리뷰어를 빼거나 바꾸지 않는다. 판독 실패면 마지막 성공 판독, 판독 이력이 없으면 진행.
 - 재기동해도 이어서 한다 — 완료 신호는 메일이 아니라 태스크 상태로 확인한다.
+
+## 멈춤과 자가 복구
+
+한 번의 예상 밖 Orca 오류가 티켓을 영구 blocked 로 만들지 않도록 오류를 셋으로 나눈다(`cbd/orca.py` `transient`).
+
+| 분류 | 무엇 | 드라이버의 대응 |
+| --- | --- | --- |
+| (a) 일시·불명 | Orca 가 확정 거부를 주지 않은 것: 응답 없음(timeout)·JSON 아닌 출력·아래 확정 코드가 아닌 오류 코드, 확정 코드라도 지나가는 상태를 말하는 것(release runs·not ready·try again…) | 같은 단계를 60·120·240초 뒤 다시(단계가 재진입 가능하므로 처음부터 다시 돈다). 진척 없이 4번째 실패면 `retryable` 표시로 멈춤 |
+| (b) 대안 경로 있음 | 구현 터미널 재사용 거부 | 즉시 새 세션 판정 |
+| (c) 사람 판단 | 확정 코드(`invalid_argument`·`task_not_startable`·`not_found`·권한), 검증 실패·리베이스 충돌·승인 대기·정체·워커 질문 | 바로 멈춤 또는 대기 |
+
+- 워커 실패(태스크 failed, 또는 워커가 worker_done 없이 exited/lost — `worker-list` 로 본다)는 태스크를 failed 로 둔 뒤
+  `worker-start --retry-of <dispatch>` 로 3회 다시 띄우고, 그래도 실패면 멈춘다. 실패한 구현 터미널은 닫는다. 리뷰어가 findings
+  파일을 남겼으면 실패여도 받아들인다.
+- 기동 응답을 잃은 worker-start 를 다시 부르기 전에 태스크 상태를 보고, 이미 dispatched/completed 면 그 워커를 이어 받는다(한
+  워크트리에 워커 둘 금지).
+- 스케줄러는 `retryable` 멈춤만 `auto_resolve.after_sec`(기본 900초) 뒤 자동 resolve·재기동한다(티켓당 `auto_resolve.max`,
+  기본 3회). 나머지 멈춤은 사람이 `cbd <키> resolve <티켓>` 한다. resolve 는 재기동 횟수(`max_restarts`)도 되돌린다.
+- 알림: 티켓 멈춤·워커 질문/에스컬레이션·자동 재개·재기동 상한 초과마다 `state/alerts.jsonl` 에 한 줄을 덧붙인다(config
+  `"alerts": false` 로 끔). 데스크톱 알림(`notify`)은 그대로다.
+
+  ```json
+  {"at": "2026-11-19T17:00:00+09:00", "project": "PRD-95", "package": "R1", "kind": "blocked",
+   "summary": "[연결 불명] 3회 재시도 후에도 실패 — …", "exception_kind": "연결 불명", "retryable": true, "terminal": "term_…"}
+  {"at": "…", "project": "PRD-95", "package": "F0", "kind": "question", "summary": "<질문 본문>",
+   "question": "…/replies/<run>/<msg>.question.md", "answer": "…/replies/<run>/<msg>.md", "msg_id": "msg_…", "worker": "ctx_…"}
+  ```
+
+  `kind`: `blocked` · `question` · `escalation` · `auto_resolved` · `restart_limit`. 질문은 `answer` 경로에 답을 쓰면 드라이버가 보낸다.
 
 ## 명령
 

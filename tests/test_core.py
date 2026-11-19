@@ -194,6 +194,67 @@ class GateTest(Env):
             self.assertFalse(g.blocked("claude")[0])  # reset passed: 0 %
 
 
+class SchedulerTest(Env):
+    def blocked(self, retryable, age_sec, **extra):
+        import datetime
+        at = (datetime.datetime.now().astimezone() - datetime.timedelta(seconds=age_sec)).isoformat(timespec="seconds")
+        self.store.save({"package": "A1", "status": "blocked", "worktree": "/x", "base": {"ref": "main"}, "restarts": 2,
+                         "exceptions": [{"kind": "연결 불명", "message": "orca 응답 없음", "at": at,
+                                         "retryable": retryable}], **extra})
+
+    def run_pass(self):
+        from cbd import cli
+        with mock.patch("cbd.orca.live_handles", return_value=frozenset()), \
+                mock.patch("cbd.orca.terminal_create", return_value="term_new") as create, \
+                mock.patch("cbd.orca.terminal_close"):
+            cli.schedule_pass(self.cfg, self.design, self.store)
+        return create
+
+    def alerts(self):
+        try:
+            with open(self.store.p("alerts.jsonl"), encoding="utf-8") as f:
+                return [json.loads(l) for l in f]
+        except FileNotFoundError:
+            return []
+
+    def test_retryable_stop_is_reopened_after_the_wait(self):
+        self.blocked(True, 1000)
+        create = self.run_pass()
+        st = self.store.ticket("A1")
+        self.assertEqual((st["status"], st["auto_resolves"], st["restarts"]), ("started", 1, 1))
+        self.assertEqual(create.call_count, 1)  # relaunched in the same round
+        self.assertEqual([a["kind"] for a in self.alerts()], ["auto_resolved"])
+
+    def test_retryable_stop_waits_and_has_a_cap(self):
+        self.blocked(True, 10)
+        self.run_pass()
+        self.assertEqual(self.store.ticket("A1")["status"], "blocked")
+        self.blocked(True, 1000, auto_resolves=3)
+        self.run_pass()
+        self.assertEqual(self.store.ticket("A1")["status"], "blocked")
+
+    def test_non_retryable_stop_waits_for_a_person(self):
+        self.blocked(False, 100000)
+        self.run_pass()
+        self.assertEqual(self.store.ticket("A1")["status"], "blocked")
+        self.assertEqual(self.alerts(), [])
+
+    def test_resolve_gives_the_restart_budget_back(self):
+        self.blocked(False, 0)
+        st = self.store.ticket("A1")
+        self.store.resolve(st)
+        st = self.store.ticket("A1")
+        self.assertEqual((st["status"], st["restarts"], st["launched_at"]), ("started", 0, None))
+        self.assertTrue(st["exceptions"][0]["resolved"])
+
+    def test_dead_driver_past_the_restart_limit_is_alerted_once(self):
+        self.store.save({"package": "A1", "status": "running", "worktree": "/x", "base": {"ref": "main"},
+                         "restarts": 3, "driver_terminal_handle": "t_gone"})
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual([a["kind"] for a in self.alerts()], ["restart_limit"])
+
+
 class LockTest(Env):
     def test_one_driver_per_ticket_and_dead_owner_takeover(self):
         a, b = TicketLock(self.store, "A1"), TicketLock(self.store, "A1")

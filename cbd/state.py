@@ -7,8 +7,10 @@ state/run-<PKG>.json   {run_id, terminal} of the ticket's Orca Run (the dashboar
 state/approvals/       <PKG>-<n> files written by `cbd approve`
 state/replies/<run>/   <msg>.question.md from workers, <msg>.md answers to send, task_<id>.complete.md
 state/scheduler.json   the scheduler terminal and the coordinator session that owns the plan
+state/alerts.jsonl     one JSON line per stop or open question (config "alerts": false turns it off)
 """
 
+import json
 import os
 import time
 
@@ -53,6 +55,31 @@ class Store:
 
     def events(self):
         return read_json(self.p("events.json"), [])
+
+    # ---- alerts (the top coordinator watches this file; the desktop notification reaches only a person at the Mac)
+    def alert(self, package, kind, summary, **extra):
+        """Append {at, project, package, kind, summary, ...} to state/alerts.jsonl. kind: blocked | question |
+        escalation | restart_limit | auto_resolved."""
+        if not self.cfg.get("alerts", True):
+            return
+        line = {"at": now_iso(), "project": self.cfg.get("project"), "package": package, "kind": kind,
+                "summary": (summary or "")[:500], **extra}
+        os.makedirs(self.dir, exist_ok=True)
+        with open(self.p("alerts.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(line, ensure_ascii=False) + "\n")
+
+    # ---- resolve (cbd resolve, and the scheduler for retryable stops)
+    def resolve(self, t):
+        """Close a ticket's open exceptions so the scheduler relaunches it; the restart budget starts again."""
+        for e in t.get("exceptions") or []:
+            if not e.get("resolved"):
+                e["resolved"] = now_iso()
+        if t.get("status") == BLOCKED:
+            t["status"] = STARTED if t.get("worktree") else PLANNED
+            t["launched_at"] = None
+        t["restarts"] = 0
+        t.pop("restart_limit_alerted", None)
+        self.save(t)
 
     # ---- approvals
     def approved(self, package, n):

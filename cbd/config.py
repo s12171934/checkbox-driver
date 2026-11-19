@@ -28,6 +28,8 @@ DEFAULTS = {
     "jira": {},
     "mail_wait_ms": 120000,
     "quiet_limit_sec": 7200,
+    "alerts": True,                 # append stops and worker questions to state/alerts.jsonl
+    "auto_resolve": {"after_sec": 900, "max": 3},  # scheduler reopens a retryable stop after_sec later, max times
 }
 
 REQUIRED = ("project", "design_root", "repos")

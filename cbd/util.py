@@ -9,10 +9,11 @@ import subprocess
 class DriverError(Exception):
     """A stop the driver cannot resolve by itself. `kind` is one of EXCEPTION_KINDS."""
 
-    def __init__(self, kind, message):
+    def __init__(self, kind, message, retryable=False):
         super().__init__(f"[{kind}] {message}")
         self.kind = kind
         self.message = message
+        self.retryable = retryable  # transient (orca.transient) and still failing after the in-driver retries
 
 
 # The categories a ticket can stop on (state.md 「미해결 예외」, plan.json status blocked).
