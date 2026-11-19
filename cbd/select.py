@@ -46,13 +46,17 @@ def base_for(design, states, cfg, package):
         if st.get("status") in DONE_STATUSES and st.get("verified_head"):
             return {"ref": st.get("branch") or design.tickets[prev].branch, "sha": st["verified_head"], "from": prev}, None
         prev = design.tickets[prev].chain_prev if prev in design.tickets else None
-    chain_head = design.chains.get(t.repo, [package])[0] if t.repo else package
-    base = design.tickets[chain_head].base if chain_head in design.tickets else None
-    repo_cfg = cfg["repos"].get(t.repo or "", {})
-    base = repo_cfg.get("base") or base
+    base = repo_base(design, cfg, t.repo, package)
     if not base:
         return None, f"저장소 베이스를 모름 ({t.repo}) — config repos.{t.repo}.base"
     return {"ref": base, "sha": None, "from": None}, None
+
+
+def repo_base(design, cfg, repo, package=None):
+    """The repo's base ref: config repos.<repo>.base, else the base of its chain's first ticket."""
+    chain_head = design.chains.get(repo, [package])[0] if repo else package
+    base = design.tickets[chain_head].base if chain_head in design.tickets else None
+    return cfg["repos"].get(repo or "", {}).get("base") or base
 
 
 def chain_gaps(design, states):

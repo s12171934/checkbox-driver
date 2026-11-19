@@ -33,6 +33,7 @@ CBD = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "bin", "cbd
 TEMPLATE = {
     "project": "<PRD-xx 이름>",
     "design_root": "<설계 워크트리 안의 feature-designs/[PRD-xx]-... 절대경로>",
+    "project_worktree": "<저장소마다 티켓 워크트리를 둘 프로젝트 워크트리 이름, 예 PRD-95 — 안 쓰면 지움>",
     "max_parallel": 12,
     "hold": {},
     "start_waived": {},

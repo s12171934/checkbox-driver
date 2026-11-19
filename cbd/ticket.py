@@ -17,7 +17,7 @@ from cbd import plan as P
 from cbd.design import expand_tcs
 from cbd.gates import Gate
 from cbd.jira import Jira
-from cbd.select import base_for
+from cbd.select import base_for, repo_base
 from cbd.state import BLOCKED, BOX_WAITING, DONE_STATUSES, RUNNING, VERIFIED, TicketLock
 from cbd.util import DriverError, git, now_iso, now_ts, run, write_text
 
@@ -119,14 +119,24 @@ class TicketDriver:
             raise DriverError("환경", problem)
         if not base.get("sha"):  # a repo base: the local branch of that name may be months behind origin
             base = dict(base, sha=self.fetch_base(repo, base["ref"]))
-        path = orca.worktree_for_branch(t.branch)
-        if path:
+        repo_name = repo.get("orca_repo") or t.repo
+        parent = self.project_worktree(repo, repo_name)
+        found = orca.find_worktree(t.branch)
+        if found:
+            path = found["path"]
+            if parent and found.get("parentWorktreeId") != parent:
+                raise DriverError("환경", f"브랜치 {t.branch} 의 워크트리 {path} 가 프로젝트 워크트리 "
+                                        f"{self.cfg['project_worktree']} 아래가 아니다 — 그 아래로 옮긴 뒤 재기동")
             if run(["git", "-C", path, "merge-base", "--is-ancestor", base["sha"], "HEAD"]).returncode != 0:
                 raise DriverError("환경", f"재사용할 워크트리 {path} 의 HEAD 가 베이스 {base['ref']} @{base['sha'][:10]} 를 "
                                         "포함하지 않는다 — 변경이 없으면 베이스로 reset, 있으면 리베이스한 뒤 재기동")
             self.log(f"워크트리 재사용 {path}")
         else:
-            path = orca.worktree_create(repo.get("orca_repo") or t.repo, t.branch, base["sha"])
+            name = (t.jira or t.branch) if parent else t.branch
+            path = orca.worktree_create(repo_name, name, t.branch, base["sha"], parent=parent)
+            actual = git(path, "rev-parse", "--abbrev-ref", "HEAD")
+            if actual != t.branch:  # Orca suffixes a --branch name that is already taken
+                raise DriverError("환경", f"워크트리 {path} 가 브랜치 {actual} 로 만들어졌다 ({t.branch} 가 이미 있다)")
             self.log(f"워크트리 생성 {path} (베이스 {base['ref']} @{base['sha'][:10]})")
         st.update(worktree=path, branch=t.branch, base=base, base_sha=git(path, "rev-parse", "HEAD"),
                   started_at=st.get("started_at") or now_iso())
@@ -139,6 +149,34 @@ class TicketDriver:
             if r.returncode != 0:
                 raise DriverError("환경", f"준비 명령 실패 `{cmd}`: {(r.stderr or r.stdout).strip()[-300:]}")
         self.jira.transition(t.jira, (self.cfg["jira"] or {}).get("progress_status"))
+
+    def project_worktree(self, repo, repo_name):
+        """Orca id of the repo's top-level project worktree (config project_worktree), created when missing the way a
+        project worktree is made by hand: Orca's default branch name, from refs/remotes/origin/<repo base>, no parent."""
+        name = self.cfg.get("project_worktree")
+        if not name:
+            return None
+        info = orca.repo_info(repo_name)
+        if not info:
+            raise DriverError("환경", f"Orca 에 저장소 {repo_name} 이 없다")
+
+        def lookup():
+            return next((w for w in orca.worktrees() if w.get("repoId") == info["id"] and w.get("displayName") == name
+                         and not w.get("parentWorktreeId")), None)
+        found = lookup()
+        if found:
+            return found["id"]
+        ref = repo_base(self.design, self.cfg, self.t.repo, self.pkg)
+        if not ref:
+            raise DriverError("환경", f"프로젝트 워크트리 {name} 의 베이스를 모름 — config repos.{self.t.repo}.base")
+        ref = ref.removeprefix("origin/")
+        self.fetch_base(repo, ref)
+        path = orca.worktree_create(repo_name, name, None, f"refs/remotes/origin/{ref}", no_parent=True)
+        found = lookup()
+        if not found:
+            raise DriverError("환경", f"프로젝트 워크트리 {name} 을 만들었지만({path}) Orca 목록에서 찾지 못했다")
+        self.log(f"프로젝트 워크트리 생성 {path} (베이스 origin/{ref})")
+        return found["id"]
 
     def fetch_base(self, repo, ref):
         """sha of origin/<ref> right after fetching it, in the repo's own checkout."""

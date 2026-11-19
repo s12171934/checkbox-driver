@@ -105,12 +105,26 @@ class FakeOrca:
     def terminal_close(self, h):
         self.closed = getattr(self, "closed", []) + [h]
 
-    def worktree_for_branch(self, b):
-        return None
+    def repo_info(self, name):
+        return {"id": "r1", "path": self.repo}
 
-    def worktree_create(self, repo, branch, base):
+    def worktrees(self):
+        return getattr(self, "records", [])
+
+    def find_worktree(self, b):
+        return next((w for w in self.worktrees() if w.get("branch") == b), None)
+
+    def worktree_create(self, repo, name, branch, base, parent=None, no_parent=False):
+        self.created = getattr(self, "created", []) + [(name, branch, base, parent, no_parent)]
+        if branch is None:  # a project worktree: only its Orca record matters here
+            path = os.path.join(os.path.dirname(self.repo), name)
+            self.records = self.worktrees() + [{"id": f"r1::{path}", "repoId": "r1", "displayName": name,
+                                                "path": path, "branch": f"dante/{name}", "parentWorktreeId": None}]
+            return path
         self.created_from = base
         sh(self.repo, "git", "checkout", "-q", "-b", branch, base)
+        self.records = self.worktrees() + [{"id": f"r1::{self.repo}", "repoId": "r1", "displayName": name,
+                                            "path": self.repo, "branch": branch, "parentWorktreeId": parent}]
         return self.repo
 
 
@@ -140,7 +154,8 @@ class TicketTest(unittest.TestCase):
 
     def drive(self, fake, pkg="A1"):
         names = ["run_create", "run_use", "task_create", "task_list", "worker_start", "dispatch", "live_handles",
-                 "check_wait", "worker_release", "worktree_for_branch", "worktree_create", "terminal_close"]
+                 "check_wait", "worker_release", "find_worktree", "worktree_create", "terminal_close", "repo_info",
+                 "worktrees"]
         with mock.patch.multiple(orca, **{n: getattr(fake, n) for n in names}), \
                 mock.patch("cbd.plan.git", return_value="deadbeef"):
             return TicketDriver(self.cfg, self.design, self.store, pkg).run()
@@ -190,11 +205,46 @@ class TicketTest(unittest.TestCase):
         self.advance_origin()
         sh(self.repo, "git", "checkout", "-q", "-b", "EX-1-A1-model")  # left over from a stale start
         fake = FakeOrca(self.repo)
-        fake.worktree_for_branch = lambda b: self.repo
+        fake.find_worktree = lambda b: {"path": self.repo}
         self.assertEqual(self.drive(fake), 2)
         exc = self.store.ticket("A1")["exceptions"][-1]
         self.assertEqual(exc["kind"], "환경")
         self.assertIn("포함하지 않는다", exc["message"])
+
+    def with_project_worktree(self):
+        conf = json.loads(_read(self.cfg.path))
+        with open(self.cfg.path, "w") as f:
+            json.dump({**conf, "project_worktree": "EX-9"}, f)
+        self.cfg = Config("ex", self.home)
+
+    def test_ticket_worktree_is_created_under_a_new_project_worktree(self):
+        self.with_project_worktree()
+        upstream = self.advance_origin()
+        fake = FakeOrca(self.repo)
+        self.assertEqual(self.drive(fake), 0)
+        project = os.path.join(self.home, "EX-9")
+        self.assertEqual(fake.created, [("EX-9", None, "refs/remotes/origin/main", None, True),
+                                        ("EX-1", "EX-1-A1-model", upstream, f"r1::{project}", False)])
+
+    def test_existing_project_worktree_is_reused(self):
+        self.with_project_worktree()
+        fake = FakeOrca(self.repo)
+        fake.records = [{"id": "r1::/p/EX-9", "repoId": "r1", "displayName": "EX-9", "path": "/p/EX-9",
+                         "branch": "dante/EX-9", "parentWorktreeId": None}]
+        self.assertEqual(self.drive(fake), 0)
+        self.assertEqual([c[0] for c in fake.created], ["EX-1"])
+        self.assertEqual(fake.created[0][3], "r1::/p/EX-9")
+
+    def test_reused_ticket_worktree_outside_the_project_blocks(self):
+        self.with_project_worktree()
+        sh(self.repo, "git", "checkout", "-q", "-b", "EX-1-A1-model")
+        fake = FakeOrca(self.repo)
+        fake.records = [{"id": "r1::/p/EX-9", "repoId": "r1", "displayName": "EX-9", "path": "/p/EX-9",
+                         "branch": "dante/EX-9", "parentWorktreeId": None},
+                        {"id": f"r1::{self.repo}", "repoId": "r1", "displayName": "EX-1-A1-model", "path": self.repo,
+                         "branch": "EX-1-A1-model", "parentWorktreeId": "r1::/elsewhere"}]
+        self.assertEqual(self.drive(fake), 2)
+        self.assertIn("프로젝트 워크트리 EX-9 아래가 아니다", self.store.ticket("A1")["exceptions"][-1]["message"])
 
     def test_failed_reviewer_with_findings_file_is_accepted(self):
         self.assertEqual(self.drive(FakeOrca(self.repo, {"review": "fail-with-file"})), 0)

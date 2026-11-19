@@ -79,31 +79,50 @@ def terminal_close(handle):
 
 
 # ---- worktrees
-def repo_path(name):
-    """Local checkout path of the Orca repo named `name`, or None."""
+def repo_info(name):
+    """The Orca repo record whose display name is `name` (id, path, ...), or None."""
     for r in call("repo", "list").get("repos") or []:
         if r.get("displayName") == name:
-            return r.get("path")
+            return r
     return None
+
+
+def repo_path(name):
+    r = repo_info(name)
+    return r.get("path") if r else None
+
+
+def worktrees():
+    return call("worktree", "list").get("worktrees") or []
+
+
+def find_worktree(branch):
+    """The Orca worktree record checked out on `branch` (id, path, displayName, parentWorktreeId), or None."""
+    try:
+        rows = worktrees()
+    except DriverError:
+        return None
+    return next((w for w in rows if w.get("branch") in (branch, f"refs/heads/{branch}")), None)
 
 
 def worktree_for_branch(branch):
-    try:
-        res = call("worktree", "list")
-    except DriverError:
-        return None
-    for w in res.get("worktrees") or []:
-        if w.get("branch") in (branch, f"refs/heads/{branch}"):
-            return w.get("path")
-    return None
+    w = find_worktree(branch)
+    return w.get("path") if w else None
 
 
-def worktree_create(repo, branch, base):
-    res = call("worktree", "create", "--repo", f"name:{repo}", "--name", branch, "--branch", branch,
-               "--base-branch", base, timeout=600)
+def worktree_create(repo, name, branch, base, parent=None, no_parent=False):
+    """New worktree `name` from `base`. branch None = Orca's prefixed default; parent = parent worktree id."""
+    args = ["worktree", "create", "--repo", f"name:{repo}", "--name", name, "--base-branch", base]
+    if branch:
+        args += ["--branch", branch]
+    if parent:
+        args += ["--parent-worktree", f"id:{parent}"]
+    elif no_parent:
+        args += ["--no-parent"]
+    res = call(*args, timeout=600)
     path = find(res, "path")
     if not path:
-        raise DriverError("환경", f"worktree create 가 경로를 주지 않았다 ({repo} {branch})")
+        raise DriverError("환경", f"worktree create 가 경로를 주지 않았다 ({repo} {name})")
     return path
 
 
