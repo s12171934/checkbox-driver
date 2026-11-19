@@ -25,7 +25,7 @@ from cbd import plan as P
 from cbd.config import Config
 from cbd.design import Design
 from cbd.select import select
-from cbd.state import ACTIVE_STATUSES, BLOCKED, DONE_STATUSES, PLANNED, STARTED, Store
+from cbd.state import ACTIVE_STATUSES, BLOCKED, DONE_STATUSES, PLANNED, STARTED, Store, driver_alive
 from cbd.util import DriverError, now_iso, write_json
 
 CBD = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "bin", "cbd"))
@@ -115,7 +115,7 @@ def cmd_status(a):
         bx = st.get("checkboxes") or []
         done = sum(1 for c in bx if c.get("phase") == "done")
         cur = next((c for c in bx if c.get("phase") not in ("done", "deferred")), None)
-        live = "●" if st.get("driver_terminal_handle") in alive else " "
+        live = "●" if driver_alive(st, alive) else ("○" if st.get("driver_terminal_handle") in alive else " ")
         line = f"{live} {pkg:4} {st.get('status', PLANNED):14} {done}/{len(bx) or len(design.tickets[pkg].boxes)}"
         if cur:
             line += f"  #{cur['index']} {', '.join(sorted((cur.get('done') or {}).keys())) or cur.get('phase')}"
@@ -125,7 +125,10 @@ def cmd_status(a):
                 print(f"      멈춤 [{e['kind']}] {e['message']}")
         for q in st.get("questions") or []:
             if not q.get("answered"):
-                print(f"      질문 {q['path']}")
+                print(f"      질문 대기 {q['msg_id']} — 답장 파일 {os.path.splitext(q['path'])[0].removesuffix('.question')}.md"
+                      f" (질문 {q['path']})")
+        if st.get("status") in ACTIVE_STATUSES and not driver_alive(st, alive):
+            print("      드라이버 프로세스 없음 — 스케줄러가 재기동한다")
 
 
 def launch(cfg, store, pkg, restart=False):
@@ -134,6 +137,9 @@ def launch(cfg, store, pkg, restart=False):
     where = cfg.get("driver_worktree") or cfg["design_root"]
     cmd = shlex.join([sys.executable, CBD, cfg.key, "run", pkg])
     handle = orca.terminal_create(f"path:{where}", f"{cfg['project']} {pkg}", cmd)
+    stale = st.get("driver_terminal_handle")
+    if stale and stale != handle:  # the previous driver exited; its terminal is only a shell now
+        orca.terminal_close(stale)
     st.update(driver_terminal_handle=handle, launched_at=now_iso(), status=STARTED if st.get("status") in
               (PLANNED, "ready", None) else st.get("status"))
     if restart:
@@ -199,7 +205,7 @@ def cmd_launch(a):
     st = store.ticket(a.package)
     if st.get("status") == BLOCKED:
         raise SystemExit(f"{a.package} 는 멈춤 상태다 — 원인을 해소한 뒤 cbd {a.key} resolve {a.package}")
-    if st.get("status") in ACTIVE_STATUSES and st.get("driver_terminal_handle") in orca.live_handles():
+    if st.get("status") in ACTIVE_STATUSES and driver_alive(st, orca.live_handles()):
         raise SystemExit(f"{a.package} 드라이버가 이미 돌고 있다 ({st['driver_terminal_handle']})")
     c = next(c for c in select(design, store.all(design.order), cfg, orca.live_handles(), forced={a.package})
              if c.package == a.package)

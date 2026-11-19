@@ -265,6 +265,45 @@ class TicketTest(unittest.TestCase):
         self.assertEqual(fake.started[0], "A1#2 구현 claude")
         self.assertEqual(self.store.ticket("A1")["status"], "verified")
 
+    def test_question_from_full_check_record_is_saved(self):
+        """`orca orchestration check --full --json` returns raw records: from_handle, payload as a JSON string."""
+        record = {"id": "msg_q1", "run_id": "run_1", "delivery_contract": "current_delivery",
+                  "from_handle": "dispatch:ctx_w1", "to_handle": "run:run_1", "subject": "Question",
+                  "body": "service-account.json 이 없다 — 어떻게 할까?", "type": "question", "priority": "normal",
+                  "payload": json.dumps({"taskId": "task_7", "dispatchId": "ctx_w1", "question": "…"}), "read": 1}
+        status = dict(record, id="msg_s1", type="status", subject="진행", body="진행 중", payload=None)
+        self.store.save({"package": "A1", "status": "running", "run_id": "run_1", "checkboxes": []})
+        driver = TicketDriver(self.cfg, self.design, self.store, "A1")
+        with mock.patch("cbd.orca.call", return_value={"messages": [status, record], "deliveryId": "dlv_1"}):
+            driver.pump("run_1")
+        qs = self.store.ticket("A1")["questions"]
+        self.assertEqual([q["msg_id"] for q in qs], ["msg_q1"])
+        text = _read(qs[0]["path"])
+        self.assertIn("ctx_w1", text)
+        self.assertIn("task_7", text)
+        self.assertIn("service-account.json 이 없다", text)
+
+    def test_unexpected_error_blocks_the_ticket_instead_of_leaving_it_running(self):
+        fake = FakeOrca(self.repo)
+        fake.check_wait = mock.Mock(side_effect=AttributeError("boom"))
+        orig = fake.worker_start
+
+        def no_finish(rid, tid, wt, *a, **k):
+            r = orig(rid, tid, wt, *a, **k)
+            fake.tasks[tid]["status"] = "running"
+            return r
+        fake.worker_start = no_finish
+        with self.assertRaises(AttributeError):
+            self.drive(fake)
+        st = self.store.ticket("A1")
+        self.assertEqual(st["status"], "blocked")
+        self.assertEqual(st["exceptions"][-1]["kind"], "드라이버 오류")
+
+    def test_worker_terminal_handle_is_kept_for_the_judge(self):
+        with mock.patch("cbd.orca.call", return_value={"dispatchId": "ctx_9", "state": "ready", "terminal": "term_9"}):
+            w = orca.worker_start("run_1", "task_1", "/wt", "claude", "m", "high", "t")
+        self.assertEqual(w, {"dispatch": "ctx_9", "handle": "term_9"})
+
     def test_failed_reviewer_with_findings_file_is_accepted(self):
         self.assertEqual(self.drive(FakeOrca(self.repo, {"review": "fail-with-file"})), 0)
         self.assertEqual(self.store.ticket("A1")["status"], "verified")

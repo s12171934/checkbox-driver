@@ -15,6 +15,7 @@ Rules (티켓 체크박스 커밋 리뷰 방식 · 같은 저장소 체인):
 Every ticket gets one Candidate, selected or not, with the reason — the canvas script node and `cbd select` print them.
 """
 
+from cbd import state as S
 from cbd.state import (ACTIVE_STATUSES, BLOCKED, BOX_DEFERRED, BOX_WAITING, DONE_STATUSES, MANUAL, PLANNED,
                        REBASE_PENDING, seconds_since)
 
@@ -77,8 +78,8 @@ def chain_gaps(design, states):
 def select(design, states, cfg, alive=frozenset(), forced=()):
     """-> [Candidate] in design order. `alive` = live driver terminal handles; `forced` = packages `cbd launch` asked for."""
     limit = int(cfg["max_parallel"])
-    running = [p for p, s in states.items() if s.get("status") in ACTIVE_STATUSES
-               and s.get("driver_terminal_handle") in alive]
+    live = {p for p, s in states.items() if s.get("status") in ACTIVE_STATUSES and S.driver_alive({"package": p, **s}, alive)}
+    running = list(live)
     slots = limit - len(running)
     gaps = chain_gaps(design, states)
     out = []
@@ -107,7 +108,7 @@ def select(design, states, cfg, alive=frozenset(), forced=()):
             continue
         restart = False
         if status in ACTIVE_STATUSES:
-            if st.get("driver_terminal_handle") in alive:
+            if pkg in live:
                 out.append(Candidate(pkg, False, "실행 중", label))
                 continue
             if int(st.get("restarts", 0)) >= int(cfg["max_restarts"]):

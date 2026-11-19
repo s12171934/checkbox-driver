@@ -179,7 +179,8 @@ def worker_start(run_id, task_id, worktree_path, agent, model, effort, title, ke
         time.sleep(delay)
         try:
             res = call(*args, timeout=300)
-            return {"dispatch": find(res, "dispatchId") or find(res, "id"), "handle": find(res, "handle")}
+            return {"dispatch": find(res, "dispatchId") or find(res, "id"),
+                    "handle": find(res, "handle") or find(res, "terminal") or find(res, "agentTerminalHandle")}
         except OrcaError as e:
             if e.code in ("task_not_startable",):
                 raise
@@ -213,7 +214,21 @@ def check_wait(run_id, timeout_ms):
         if "timeout" in str(e).lower():
             return []
         raise
-    return res.get("messages") or []
+    return [message(m) for m in res.get("messages") or []]
+
+
+def message(m):
+    """One mailbox row in one shape. `check --full` gives raw records (from_handle, payload as a JSON string)."""
+    payload = m.get("payload")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            payload = {}
+    return {"id": m.get("id", ""), "type": m.get("type") or "status",
+            "from": (m.get("from") or m.get("from_handle") or "").removeprefix("dispatch:"),
+            "subject": m.get("subject") or "", "body": m.get("body") or "",
+            "payload": payload if isinstance(payload, dict) else {}}
 
 
 def reply(msg_id, body):

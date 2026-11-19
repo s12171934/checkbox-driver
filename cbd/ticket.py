@@ -91,6 +91,9 @@ class TicketDriver:
         except DriverError as e:
             self.block(e)
             return 2
+        except Exception as e:  # a driver bug must not leave the ticket looking alive under "running"
+            self.block(DriverError("드라이버 오류", f"{type(e).__name__}: {e}"))
+            raise
         finally:
             lock.release()
             try:
@@ -443,12 +446,12 @@ class TicketDriver:
             if m.get("type") in ("question", "escalation"):
                 d = self.store.reply_dir(rid)
                 path = os.path.join(d, f"{m['id']}.question.md")
-                write_text(path, f"# {m.get('subject', '')}\n\n- 보낸 이: {m.get('from')}\n- 태스크: "
-                                 f"{(m.get('payload') or {}).get('taskId', '')}\n\n{m.get('body', '')}\n")
+                write_text(path, f"# {m['subject']}\n\n- 보낸 이: {m['from']}\n- 태스크: {m['payload'].get('taskId', '')}"
+                                 f"\n\n{m['body']}\n")
                 self.st.setdefault("questions", []).append({"msg_id": m["id"], "path": path, "at": now_iso()})
                 self.save()
                 self.log(f"질문 대기 — {path}")
-                self.notify(f"{self.pkg} 워커 질문: {m.get('subject', '')[:60]}")
+                self.notify(f"{self.pkg} 워커 질문: {(m['body'] or m['subject'])[:60]}")
         d = self.store.reply_dir(rid)
         for q in self.st.get("questions") or []:
             ans = os.path.join(d, f"{q['msg_id']}.md")

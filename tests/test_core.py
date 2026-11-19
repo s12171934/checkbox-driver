@@ -116,6 +116,15 @@ class SelectTest(Env):
         states["A1"]["restarts"] = 3
         self.assertIn("재기동", self.sel(states)["A1"].reason)
 
+    def test_driver_whose_process_died_is_restarted_even_if_its_terminal_lives(self):
+        states = {"A1": {"status": "started", "driver_terminal_handle": "t1", "pid": 4242, "worktree": "/x",
+                         "base": {"ref": "main"}}}
+        with mock.patch("cbd.state.pid_command", return_value=None):  # the driver exited; its shell stays open
+            c = self.sel(states, alive={"t1"})["A1"]
+        self.assertTrue(c.selected and c.restart)
+        with mock.patch("cbd.state.pid_command", return_value="python3 /x/bin/cbd ex run A1"):
+            self.assertEqual(self.sel(states, alive={"t1"})["A1"].reason, "실행 중")
+
     def test_hold_and_force(self):
         self.write_conf(hold={"A1": "사람 로그인"})
         self.assertEqual(self.sel({})["A1"].reason, "보류: 사람 로그인")

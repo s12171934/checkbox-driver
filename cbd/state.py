@@ -143,6 +143,28 @@ def _alive(pid):
         return True
 
 
+def pid_command(pid):
+    """Command line of a running process, or None."""
+    import subprocess
+    try:
+        r = subprocess.run(["ps", "-p", str(int(pid)), "-o", "command="], capture_output=True, text=True, timeout=10)
+    except (ValueError, OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout.strip() or None
+
+
+def driver_alive(st, alive):
+    """A ticket driver is alive when its terminal is open and, once it recorded its pid, that process still runs it.
+    A driver that exits (멈춤, crash) leaves its terminal open at a shell prompt, so the terminal alone is not enough."""
+    if st.get("driver_terminal_handle") not in alive:
+        return False
+    pid = st.get("pid")
+    if not pid:
+        return True  # launched, not yet started: the launch cooldown covers this window
+    cmd = pid_command(pid) or ""
+    return "cbd" in cmd and f" run {st.get('package', '')}" in cmd
+
+
 def seconds_since(iso):
     import datetime
     try:
