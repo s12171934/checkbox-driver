@@ -58,11 +58,13 @@ status: active
 cbd <키> init --design-root <경로> --project <이름>   # config.json 틀
 cbd <키> check                                        # 설계 읽기 점검 (경고 있으면 exit 1)
 cbd <키> select [--json]                              # 지금 띄울 수 있는 티켓과 사유 (jsonl)
-cbd <키> schedule [--once [--json]] [--interval 60]   # 스케줄러
+cbd <키> schedule --coordinator-session <세션 id> [--once [--json]] [--interval 60]   # 스케줄러
 cbd <키> launch <티켓> · run <티켓>                   # 하나만 띄우기 · 티켓 드라이버 본체
 cbd <키> status · plan                                # 현황 · plan.json/state.md 갱신
 cbd <키> approve <티켓> <번호> · resolve <티켓> · defer <티켓> <번호>
 ```
+
+- 처음 띄울 때 `--coordinator-session` 에 감독하는 코디네이터 세션 id 를 준다. 값은 `scheduler.json` 에 남아 재기동 때 생략해도 된다. 없으면 대시보드가 plan.json 을 코디네이터에 붙이지 못해 워커 계획·묶음이 안 보인다.
 
 ## 재구성하지 못한 것 (다음 단계)
 
