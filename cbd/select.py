@@ -7,6 +7,8 @@ Rules (티켓 체크박스 커밋 리뷰 방식 · 같은 저장소 체인):
   It never starts on top of an in-progress branch.
 - verified tickets must be a prefix of each chain; a gap stops the scheduler for that chain.
 - Held tickets (`hold`) start only through `cbd launch`.
+- A branchless verification ticket (single-doc 「—」 branch) is never started, not even by `cbd launch`: a person does
+  its checks. Its dependents wait for it until the person lists it in their `start_waived`.
 - At most `max_parallel` tickets run at once; a ticket launched less than `launch_cooldown_sec` ago is not relaunched;
   a ticket whose driver died is relaunched up to `max_restarts` times.
 
@@ -83,6 +85,9 @@ def select(design, states, cfg, alive=frozenset(), forced=()):
         if not t.repo:
             out.append(Candidate(pkg, False, "저장소 없음 — 드라이버가 몰지 않는 티켓(감사 등)", label))
             continue
+        if t.verification_only:
+            out.append(Candidate(pkg, False, "브랜치 없는 검증 티켓 — 드라이버가 몰지 않는다(사람이 확인)", label))
+            continue
         if status in DONE_STATUSES:
             out.append(Candidate(pkg, False, "완료" if status != REBASE_PENDING else "리베이스 대기", label))
             continue
@@ -114,7 +119,7 @@ def select(design, states, cfg, alive=frozenset(), forced=()):
         waived = set(cfg["start_waived"].get(pkg, []))
         waiting = [d for d in t.predecessors if d not in waived and states.get(d, {}).get("status") not in DONE_STATUSES]
         if waiting and pkg not in forced and status != BOX_WAITING:
-            out.append(Candidate(pkg, False, "선행 대기: " + ", ".join(waiting), label))
+            out.append(Candidate(pkg, False, "선행 대기: " + ", ".join(waiting_label(design, d) for d in waiting), label))
             continue
         if status == BOX_WAITING and not box_ready(cfg, states, pkg, st):
             out.append(Candidate(pkg, False, "체크박스 선행 대기: " + st.get("waiting_on", ""), label))
@@ -133,6 +138,11 @@ def select(design, states, cfg, alive=frozenset(), forced=()):
         out.append(Candidate(pkg, True, why, label, base, restart))
         slots -= 1
     return out
+
+
+def waiting_label(design, package):
+    t = design.tickets.get(package)
+    return f"{package} (브랜치 없는 검증 티켓 — 끝나면 start_waived)" if t and t.verification_only else package
 
 
 def box_ready(cfg, states, package, st):

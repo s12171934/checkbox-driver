@@ -7,6 +7,15 @@ Inputs (all under <design_root>):
 - plan/order.md         완료 기준 tables and the 스택 체인 table (branch names per repo, in chain order).
 - tests/*.md            TC rows (ID or TC column, optional 층 column), used to expand layer-named criteria.
 
+Single-doc form — no plan/commits.md but <design_root>/design.md: the same tickets are read from one document.
+Section numbers move between projects, so sections are found by heading words and tables by their header names:
+- 구현 순서 table (패키지 · 선행 · 테스트)                   ticket order, title, predecessors, criteria fallback.
+- 트리 table (티켓 · 저장소 · 브랜치 · 베이스/스택 부모 · 대상 테스트 · is blocked by) — the 티켓 cell starts with the
+  Jira key; a base cell naming a package is the chain parent; a 「—」 branch marks a branchless verification ticket.
+- 스택 체인 table (저장소 · 체인 「`base` ← R1 `branch` ← R2 `branch`」)   chains and branch names.
+- 체크리스트 section: 「R1 — PSD-1 · `branch`」 then a ``` block of 「[ ] <commit title>」 lines (the 「[ ] 완료」 line is not a box).
+- 테스트 케이스 section: TC rows, as tests/*.md.
+
 Column positions differ between projects, so every table is read by its header names.
 """
 
@@ -62,6 +71,29 @@ def packages_in(cell):
     if cell.strip() in DASH:
         return []
     return [p for p in (package_of(x) for x in re.split(r"[·,→/]|\s+", cell)) if p]
+
+
+def is_dash(cell):
+    """'—' / '— (브랜치 없음)' / '' -> True."""
+    cell = strip_md(cell)
+    return not cell or cell[0] in "—-–"
+
+
+def section(text, words):
+    """(heading, body) of the first heading containing words, up to the next heading of the same or higher level."""
+    lines = text.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        h = re.match(r"^(#+)\s+(.*)$", line)
+        if not h or words not in h.group(2):
+            continue
+        level, body = len(h.group(1)), []
+        for nxt in lines[i + 1:]:
+            n = re.match(r"^(#+)\s", nxt)
+            if n and len(n.group(1)) <= level:
+                break
+            body.append(nxt)
+        return h.group(2).strip(), "".join(body)
+    return "", ""
 
 
 def strip_md(cell):
@@ -121,6 +153,7 @@ class Ticket:
         self.index_section = ""   # the ticket's ### section of ticket-index.md (읽을 노드 목록) — goes into briefs
         self.index_tests = ""     # its 「테스트:」 line, the fallback when order.md has no 완료 기준
         self.tcs = []
+        self.verification_only = False  # single-doc 「—」 branch: a checklist of checks, not commits — never driven
         self.chain_position = 0
         self.chain_length = 0
 
@@ -132,17 +165,21 @@ class Design:
     def __init__(self, root, tc_pattern=r"TC-[A-Z0-9]+-\d+"):
         self.root = root
         self.tc_pattern = tc_pattern
-        if not os.path.isfile(self.p("plan", "commits.md")):
-            raise DriverError("착수 시트", f"설계 루트에 plan/commits.md 가 없다: {root}")
+        self.single_doc = not os.path.isfile(self.p("plan", "commits.md")) and os.path.isfile(self.p("design.md"))
+        if not self.single_doc and not os.path.isfile(self.p("plan", "commits.md")):
+            raise DriverError("착수 시트", f"설계 루트에 plan/commits.md 도 design.md 도 없다: {root}")
         self.tickets = {}
         self.order = []
         self.chains = {}           # repo -> [package] in chain order
         self.warnings = []
         self._tc_rows = None
-        self._read_commits()
-        self._read_index()
-        self._read_jira_map()
-        self._read_order()
+        if self.single_doc:
+            self._read_single_doc()
+        else:
+            self._read_commits()
+            self._read_index()
+            self._read_jira_map()
+            self._read_order()
         self._finish()
 
     def p(self, *parts):
@@ -173,6 +210,130 @@ class Design:
             m = re.match(r"^- \[([ xX])\]\s+`(.+)`([^`]*)$", line)
             if m and current is not None:
                 current.boxes.append(Box(len(current.boxes) + 1, m.group(2), m.group(1) != " ", m.group(3).strip()))
+
+    # ---- design.md (single-doc form)
+    def _read_single_doc(self):
+        doc = self.text("design.md")
+        order_heading, order_body = section(doc, "구현 순서")
+        for head, rows, _ in tables(order_body):
+            pi, di, ti = col(head, "패키지"), col(head, "선행"), col(head, "테스트", "완료 기준")
+            if pi is None or di is None:
+                continue
+            for r in rows:
+                pkg = package_of(r[pi]) if pi < len(r) else None
+                if not pkg:
+                    continue
+                t = self.ticket(pkg)
+                t.predecessors = packages_in(r[di]) if di < len(r) else []
+                if ti is not None and ti < len(r) and not is_dash(r[ti]):
+                    t.criteria = r[ti]
+            break
+        tree_rows = self._read_tree(doc)
+        for pkg in self.order:
+            if pkg not in tree_rows:
+                self.warnings.append(f"{pkg}: 티켓 트리 표에 행이 없다")
+        self._read_chain_table(doc)
+        blocks, list_heading = self._read_checklists(doc)
+        for pkg, t in self.tickets.items():
+            parts = [blocks.get(pkg, "")]
+            if pkg in tree_rows:
+                parts.append(tree_rows[pkg])
+            src = " · ".join(f"「{h}」" for h in (list_heading, tree_rows.get("", ""), order_heading) if h)
+            parts.append(f"정본: design.md — {src}")
+            t.index_section = "\n\n".join(p for p in parts if p)
+        tree_rows.pop("", None)
+
+    def _read_tree(self, doc):
+        """Rows of the 티켓 트리 table -> {package: 'heading + header + raw row'}, '' -> the table heading."""
+        out = {}
+        for head, rows, heading in tables(doc):
+            ci, ri, bi = col(head, "티켓"), col(head, "저장소"), col(head, "브랜치")
+            pi, ti, di = col(head, "베이스", "스택 부모"), col(head, "대상 테스트", "테스트"), col(head, "is blocked by", "선행")
+            if ci != 0 or None in (ri, bi, di):
+                continue
+            out[""] = heading
+            header = "| " + " | ".join(head) + " |"
+            for r in rows:
+                get = lambda i: r[i] if i is not None and i < len(r) else ""
+                m = re.match(r"([A-Z][A-Z0-9]+-\d+)\s+(.*)$", strip_md(r[0]))
+                jira, rest = (m.group(1), m.group(2)) if m else ("", strip_md(r[0]))
+                pkg = package_of(rest)
+                if not pkg:
+                    continue
+                t = self.ticket(pkg)
+                t.jira = jira or t.jira
+                t.title = re.sub(r"\s*\(§[^)]*\)\s*$", "", rest[len(pkg):]).strip() or t.title
+                t.repo = None if is_dash(get(ri)) else strip_md(get(ri))
+                if is_dash(get(bi)):
+                    t.branch, t.verification_only = "", True
+                else:
+                    t.branch = strip_md(get(bi))
+                parent = "" if is_dash(get(pi)) else strip_md(get(pi))
+                parent_pkg = packages_in(parent)
+                if parent_pkg:
+                    t.chain_prev = parent_pkg[0]
+                elif parent:
+                    t.base = parent
+                if ti is not None:
+                    t.criteria = "" if is_dash(get(ti)) else get(ti)
+                t.predecessors = packages_in(get(di))
+                out[pkg] = f"{heading}:\n{header}\n| " + " | ".join(r) + " |"
+            break
+        return out
+
+    def _read_chain_table(self, doc):
+        for head, rows, _ in tables(doc):
+            ri, chi = col(head, "저장소"), col(head, "체인")
+            if ri is None or chi is None or col(head, "티켓") is not None:
+                continue
+            for r in rows:
+                repo, cell = strip_md(r[ri]), r[chi] if chi < len(r) else ""
+                segments = [x.strip() for x in re.split(r"←", cell)] if "←" in cell else [cell]
+                chain, base = [], None
+                for seg in segments:
+                    pkg = package_of(strip_md(seg))
+                    if not pkg:
+                        base = base or strip_md(seg) or None
+                        continue
+                    chain.append(pkg)
+                    t = self.ticket(pkg)
+                    t.repo = t.repo or repo
+                    bm = re.search(r"`([^`]+)`", seg)
+                    if bm and not t.branch:
+                        t.branch = bm.group(1)
+                    elif bm and bm.group(1) != t.branch:
+                        self.warnings.append(f"{pkg}: 트리 표 브랜치 {t.branch} 와 스택 체인 {bm.group(1)} 가 다르다")
+                if chain:
+                    self.chains[repo] = chain
+                    head_ticket = self.tickets[chain[0]]
+                    head_ticket.base = head_ticket.base or base
+            break
+
+    def _read_checklists(self, doc):
+        """Boxes from the 체크리스트 section -> ({package: raw block}, heading)."""
+        heading, body = section(doc, "체크리스트")
+        blocks, current, start, fence = {}, None, 0, False
+        lines = body.splitlines()
+        for i, line in enumerate(lines):
+            if line.strip().startswith("```"):
+                fence = not fence
+                if not fence and current:
+                    blocks[current] = "\n".join(lines[start:i + 1]).strip()
+                    current = None
+                continue
+            if fence:
+                m = re.match(r"^\s*(?:- )?\[([ xX])\]\s+(.+?)\s*$", line)
+                if m and current and m.group(2) != "완료":
+                    t = self.tickets[current]
+                    t.boxes.append(Box(len(t.boxes) + 1, m.group(2), m.group(1) != " "))
+                continue
+            h = re.match(r"^([A-Z][A-Z0-9]*\d+[A-Za-z]?)\s+—\s+", line)
+            if h:
+                current, start = h.group(1), i
+                if current not in self.tickets:
+                    self.warnings.append(f"{current}: 체크리스트에 있지만 구현 순서·트리 표에 없다")
+                    self.ticket(current)
+        return blocks, heading
 
     # ---- plan/ticket-index.md
     def _read_index(self):
@@ -270,7 +431,7 @@ class Design:
             if not t.tcs and t.index_tests:
                 t.tcs = self.criteria_tcs(t.index_tests)
             if not t.boxes:
-                self.warnings.append(f"{t.package}: commits.md 에 체크박스가 없다")
+                self.warnings.append(f"{t.package}: {'체크리스트' if self.single_doc else 'commits.md'} 에 체크박스가 없다")
         # chains: order.md wins; otherwise follow 체인 앞 links from ticket-index
         if not self.chains:
             for t in self.tickets.values():
@@ -304,10 +465,7 @@ class Design:
         if self._tc_rows is not None:
             return self._tc_rows
         rows = {}
-        for path in sorted(glob.glob(self.p("tests", "*.md"))):
-            with open(path, encoding="utf-8") as f:
-                text = f.read()
-            stem = os.path.splitext(os.path.basename(path))[0]
+        for stem, text in self._tc_sources():
             for head, body, heading in tables(text):
                 idc = col(head, "ID", "TC")
                 if idc is None:
@@ -322,6 +480,15 @@ class Design:
                         rows.setdefault(tc, {"layer": layer, "file": stem, "row": "| " + " | ".join(r) + " |"})
         self._tc_rows = rows
         return rows
+
+    def _tc_sources(self):
+        """(stem, text) of every TC document: tests/*.md, or the 테스트 케이스 section of design.md."""
+        if self.single_doc:
+            yield "design", section(self.text("design.md"), "테스트 케이스")[1]
+            return
+        for path in sorted(glob.glob(self.p("tests", "*.md"))):
+            with open(path, encoding="utf-8") as f:
+                yield os.path.splitext(os.path.basename(path))[0], f.read()
 
     def criteria_tcs(self, criteria):
         """TC IDs of a 완료 기준 cell, including 「tests/M 의 storybook 층 TC-M-* 전부」 style layer phrases."""

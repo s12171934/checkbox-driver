@@ -25,6 +25,11 @@ status: active
 
 - 설계: `<design_root>/plan/commits.md`(체크박스 = 커밋) · `ticket-index.md`(요약표·티켓 절) · `jira-map.md`(Jira 키·브랜치) ·
   `order.md`(완료 기준·스택 체인) · `tests/*.md`(TC 행). 표는 머리글 이름으로 읽으므로 열 순서가 달라도 된다.
+- single-doc 설계: `plan/commits.md` 가 없고 `<design_root>/design.md` 가 있으면 그 한 장에서 같은 것을 읽는다 — 절 번호가 아니라
+  머리글 낱말(「구현 순서」·「체크리스트」·「테스트 케이스」)과 표 머리글(트리 `티켓 · 저장소 · 브랜치 · 베이스/스택 부모 · 대상 테스트 ·
+  is blocked by`, 스택 체인 `저장소 · 체인`)로 찾는다. 체크리스트는 「R1 — PSD-1 · \`브랜치\`」 아래 코드 블록의 `[ ] <커밋 제목>`
+  줄이고 `[ ] 완료` 줄은 버린다. 브랜치가 「—」인 검증 티켓은 드라이버가 띄우지 않으며(`launch` 도 안 됨), 그 티켓을 선행으로 둔
+  티켓은 사람이 검증을 마치고 `start_waived` 에 적을 때까지 기다린다.
 - 설정·상태: `~/.checkbox-driver/<키>/` (`CBD_HOME` 으로 바꿈) — `config.json`, `state/<티켓>.json`, `state/plan.json`(에이전트
   대시보드 `external_plans` 계약), `state/state.md`, `state/replies/<run>/`, `logs/`, `work/<티켓>/<NN>/`(브리프·초안·findings·판정문).
 
