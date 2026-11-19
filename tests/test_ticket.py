@@ -48,6 +48,9 @@ class FakeOrca:
         pass
 
     def task_create(self, rid, title, spec, deps):
+        missing = [d for d in deps or [] if d not in self.tasks]
+        if missing:  # Orca refuses a dependency from another Run
+            raise orca.OrcaError("runtime_error", f"Dependency task {missing[0]} must belong to run {rid}")
         self.n += 1
         tid = f"task_{self.n}"
         self.tasks[tid] = {"id": tid, "status": "pending"}
@@ -245,6 +248,22 @@ class TicketTest(unittest.TestCase):
                          "branch": "EX-1-A1-model", "parentWorktreeId": "r1::/elsewhere"}]
         self.assertEqual(self.drive(fake), 2)
         self.assertIn("프로젝트 워크트리 EX-9 아래가 아니다", self.store.ticket("A1")["exceptions"][-1]["message"])
+
+    def test_new_run_does_not_depend_on_done_checkbox_tasks_of_the_old_run(self):
+        head = sh(self.repo, "git", "rev-parse", "HEAD")
+        sh(self.repo, "git", "checkout", "-q", "-b", "EX-1-A1-model")
+        sh(self.repo, "git", "commit", "-q", "--allow-empty", "-m", "[EX-1] test(core): TC-A-01~TC-A-03 빨강")
+        a1 = self.design.tickets["A1"]
+        done = {"impl": "x", "review-codex": "x", "review-claude": "x", "judge": "x"}
+        boxes = [{"index": b.index, "title": b.title, "phase": "pending", "kind": "agent"} for b in a1.boxes]
+        boxes[0].update(phase="done", tasks={k: f"old_{k}" for k in done}, done=done)  # finished in a Run now gone
+        boxes[2]["kind"] = "driver-verify"
+        self.store.save({"package": "A1", "status": "planned", "worktree": self.repo, "branch": "EX-1-A1-model",
+                         "base": {"ref": "main", "sha": head, "from": None}, "base_sha": head, "checkboxes": boxes})
+        fake = FakeOrca(self.repo)
+        self.assertEqual(self.drive(fake), 0, self.store.ticket("A1").get("exceptions"))
+        self.assertEqual(fake.started[0], "A1#2 구현 claude")
+        self.assertEqual(self.store.ticket("A1")["status"], "verified")
 
     def test_failed_reviewer_with_findings_file_is_accepted(self):
         self.assertEqual(self.drive(FakeOrca(self.repo, {"review": "fail-with-file"})), 0)

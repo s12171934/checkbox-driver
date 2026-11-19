@@ -221,9 +221,10 @@ class TicketDriver:
             for k in [k for k, tid in (c.get("tasks") or {}).items() if tid not in known and not (c.get("done") or {}).get(k)]:
                 c["tasks"].pop(k)
                 (c.get("dispatch") or {}).pop(k, None)
-        for c in self.st["checkboxes"]:
+        for c in self.st["checkboxes"]:  # a done checkbox may keep ids of an old Run; Orca refuses deps across Runs
             for k, tid in (c.get("tasks") or {}).items():
-                key_to_task[(c["index"], k)] = tid
+                if tid in known:
+                    key_to_task[(c["index"], k)] = tid
         rows = B.ticket_sessions(self.cfg, self.t, self._boxes())
         by_key = {r["key"]: r for r in rows}
         created = 0
