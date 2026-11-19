@@ -452,6 +452,17 @@ class TicketTest(unittest.TestCase):
         self.assertIn("스테이지 없이", verify)
         self.assertNotIn("스테이지 없이", feat)
 
+    def test_every_brief_forbids_complex_shell_expansion(self):
+        from cbd import briefs
+        t = self.design.tickets["A1"]
+        box = t.boxes[1]
+        texts = [briefs.impl(self.cfg, self.design, t, box, "/wt", "/work"),
+                 briefs.review(self.cfg, self.design, t, box, "/wt", "/work", "codex"),
+                 briefs.judge(self.cfg, self.design, t, box, "/wt", "/work")]
+        for text in texts:
+            self.assertIn("zsh 배열·`${(f)…}`·중첩 `$(…)` 확장 금지", text)
+            self.assertIn("`xargs` 로 넘기거나", text)
+
     def test_restart_resumes_after_done_signal(self):
         fake = FakeOrca(self.repo)
         orig = fake.worker_start
