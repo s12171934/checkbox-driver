@@ -79,12 +79,16 @@ class FakeOrca:
         work = self._work(spec)
         if "구현" in key:
             n = key.split("#")[1].split()[0]
-            with open(os.path.join(wt, f"f{n}.txt"), "w") as f:
-                f.write(n)
-            sh(wt, "git", "add", f"f{n}.txt")
+            if int(n) not in self.behaviour.get("no_stage", ()):
+                with open(os.path.join(wt, f"f{n}.txt"), "w") as f:
+                    f.write(n)
+                sh(wt, "git", "add", f"f{n}.txt")
+            if int(n) not in self.behaviour.get("no_test_result", ()):
+                with open(os.path.join(work, "test-result.md"), "w") as f:
+                    f.write("통과\n")
             title = _read(spec).split("첫 줄은 정확히 `")[1].split("`")[0]
             with open(os.path.join(work, "commit-message.md"), "w") as f:
-                f.write(title + "\n")
+                f.write(title + "\n\n코드 변경 없음\n")
             self.tasks[tid]["status"] = "completed"
         elif "리뷰" in key:
             name = key.split()[-1]
@@ -370,6 +374,60 @@ class TicketTest(unittest.TestCase):
         fake.worker_start = lazy
         self.assertEqual(self.drive(fake), 2)
         self.assertIn("스테이지", self.store.ticket("A1")["exceptions"][-1]["message"])
+
+    def override(self, *keys):
+        with open(os.path.join(self.home, "ex", "config.json")) as f:
+            conf = json.load(f)
+        conf["agent_box_overrides"] = list(keys)
+        with open(os.path.join(self.home, "ex", "config.json"), "w") as f:
+            json.dump(conf, f)
+        self.cfg = Config("ex", self.home)
+        self.store = Store(self.cfg)
+
+    def test_agent_verify_without_stage_commits_empty_and_skips_review(self):
+        self.override("A1#3")
+        fake = FakeOrca(self.repo, {"no_stage": {3}})
+        self.assertEqual(self.drive(fake), 0)
+        st = self.store.ticket("A1")
+        self.assertEqual(st["status"], "verified")
+        self.assertEqual(sh(self.repo, "git", "log", "-1", "--format=%s"), "[EX-1] verify: A1 테스트 그린")
+        self.assertEqual(sh(self.repo, "git", "log", "-1", "--format=%b"), "코드 변경 없음")
+        self.assertEqual(sh(self.repo, "git", "diff", "--name-only", "HEAD~1", "HEAD"), "")  # an empty commit
+        self.assertEqual([k for k in fake.started if k.startswith("A1#3")], ["A1#3 구현 claude"])
+        box3 = next(c for c in st["checkboxes"] if c["index"] == 3)
+        skipped = ["review-codex", "review-claude", "judge"]
+        self.assertEqual(sorted(box3["skipped"]), sorted(skipped))
+        self.assertEqual(sorted(t for t, s in fake.updates if s == "completed"),
+                         sorted(box3["tasks"][k] for k in skipped))  # the precreated tasks are closed
+        self.assertIn(f"h_{box3['tasks']['impl']}", fake.closed)
+        plan = json.loads(_read(self.store.p("plan.json")))
+        a1 = next(t for t in plan["tickets"] if t["package"] == "A1")
+        self.assertEqual(sorted(s["kind"] for s in a1["sessions"] if s["status"] == "skipped"), sorted(skipped))
+        self.assertTrue(any("건너뜀" in e["text"] for e in self.store.events()))
+
+    def test_agent_verify_without_stage_needs_test_result(self):
+        self.override("A1#3")
+        fake = FakeOrca(self.repo, {"no_stage": {3}, "no_test_result": {3}})
+        self.assertEqual(self.drive(fake), 2)
+        e = self.store.ticket("A1")["exceptions"][-1]
+        self.assertEqual(e["kind"], "정체")
+        self.assertIn("test-result.md", e["message"])
+
+    def test_agent_verify_with_stage_keeps_review_and_judge(self):
+        self.override("A1#3")
+        fake = FakeOrca(self.repo)
+        self.assertEqual(self.drive(fake), 0)
+        self.assertEqual([k for k in fake.started if k.startswith("A1#3")],
+                         ["A1#3 구현 claude", "A1#3 리뷰 codex", "A1#3 리뷰 claude", "A1#3 판정 claude"])
+        self.assertNotIn("skipped", next(c for c in self.store.ticket("A1")["checkboxes"] if c["index"] == 3))
+
+    def test_verify_impl_brief_allows_no_stage(self):
+        from cbd import briefs
+        t = self.design.tickets["A1"]
+        verify = briefs.impl(self.cfg, self.design, t, t.boxes[2], "/wt", "/work")
+        feat = briefs.impl(self.cfg, self.design, t, t.boxes[1], "/wt", "/work")
+        self.assertIn("스테이지 없이", verify)
+        self.assertNotIn("스테이지 없이", feat)
 
     def test_restart_resumes_after_done_signal(self):
         fake = FakeOrca(self.repo)

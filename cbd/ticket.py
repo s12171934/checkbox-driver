@@ -392,7 +392,11 @@ class TicketDriver:
                 self.launch(c, "impl")
             self.wait_task(c, "impl")
         if run(["git", "-C", wt, "diff", "--cached", "--quiet"]).returncode == 0:
-            raise DriverError("정체", f"{c['index']}번 구현이 스테이지를 남기지 않았다")
+            if not self.is_verify(c):
+                raise DriverError("정체", f"{c['index']}번 구현이 스테이지를 남기지 않았다")
+            self.empty_verify(c, p)
+            self.close_box_workers(c)
+            return
         if not os.path.exists(p["draft"]):
             raise DriverError("정체", f"{c['index']}번 구현이 커밋 메시지 초안을 남기지 않았다 ({p['draft']})")
         reviewers = self.cfg["reviewers"]
@@ -410,11 +414,51 @@ class TicketDriver:
                 self.launch(c, "judge")
             self.wait_task(c, "judge")
         self.check_commit(c)
-        for k, d in disp.items():
+        self.close_box_workers(c)
+
+    def close_box_workers(self, c):
+        for k, d in (c.get("dispatch") or {}).items():
             if k != "judge" and d:
                 orca.worker_release(d)
         if c.get("impl_handle"):  # kept open for the judge (which ran in it, or not); the checkbox is over (루프 10 종료)
             orca.terminal_close(c["impl_handle"])
+
+    @staticmethod
+    def is_verify(c):
+        return re.match(r"verify[(:!]", c["title"]) is not None
+
+    def empty_verify(self, c, p):
+        """A verify box whose implementer changed no code: nothing to review, so the reviewers and the judge are
+        skipped and the driver commits the implementer's draft with --allow-empty (the test result is the evidence)."""
+        wt = self.st["worktree"]
+        for key in ("test", "draft"):
+            if not os.path.exists(p[key]):
+                raise DriverError("정체", f"{c['index']}번 verify 구현이 스테이지 없이 {os.path.basename(p[key])} 도 "
+                                        f"남기지 않았다 ({p[key]})")
+        if git(wt, "rev-parse", "HEAD") == c.get("head_before"):  # a restart after the commit only re-checks it
+            with open(p["draft"], encoding="utf-8") as f:
+                first = f.readline().strip()
+            if first != self.subject(c):
+                raise DriverError("검증 실패", f"{c['index']}번 초안 첫 줄이 커밋 제목과 다르다: {first[:100]}")
+            self.skip_sessions(c, "verify 에 스테이지가 없다 — 코드 변경 없음, 드라이버가 초안으로 빈 커밋")
+            r = run(["git", "-C", wt, "commit", "--allow-empty", "-F", p["draft"]])
+            if r.returncode != 0:
+                raise DriverError("환경", f"{c['index']}번 빈 커밋 실패 (훅?): {(r.stderr or r.stdout).strip()[-300:]}")
+        self.check_commit(c)
+
+    def skip_sessions(self, c, why):
+        """Reviewers and judge that will not run: their precreated tasks are closed and the plan shows them skipped."""
+        rid, skipped = self.st["run_id"], c.setdefault("skipped", {})
+        kinds = [f"review-{r['name']}" for r in self.cfg["reviewers"]] + ["judge"]
+        for kind in kinds:
+            if kind in skipped or (c.get("done") or {}).get(kind):
+                continue
+            tid = (c.get("tasks") or {}).get(kind)
+            if tid:
+                orca.task_update(rid, tid, "completed", f"cbd: 건너뜀 — {why}")
+            skipped[kind] = why
+            self.save()
+        self.log(f"#{c['index']} 리뷰·판정 건너뜀 ({', '.join(kinds)}) — {why}")
 
     def launch(self, c, kind, retry_of=None):
         """Start the worker of `kind` (impl | review-<name> | judge) and record its dispatch."""

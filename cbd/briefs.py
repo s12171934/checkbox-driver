@@ -3,7 +3,8 @@
 
 The original briefs were lost; these restate the loop rules (티켓 체크박스 커밋 리뷰 루프 · 라운드 · 커밋과 지라 갱신)
 in the form the driver checks afterwards: staged changes + commit-message.md after implementation, findings-<name>.md
-per reviewer, verdict.md + exactly one new commit whose subject is the checkbox title after the judge.
+per reviewer, verdict.md + exactly one new commit whose subject is the checkbox title after the judge. A verify box
+that changed no code leaves no stage, only test-result.md + commit-message.md, and the driver commits it --allow-empty.
 """
 
 import os
@@ -53,6 +54,9 @@ def impl(cfg, design, ticket, box, worktree, work, tc_rows=""):
     c = context(cfg, design, ticket, box, worktree, work)
     p = paths(work)
     tc = f"\n- 이 체크박스의 TC 행 원문: `{p['tc_rows']}`" if tc_rows else ""
+    verify = (f"\n\n   **verify 체크박스에서 코드 변경이 없으면 스테이지 없이 끝낸다** — 테스트 결과와 초안만 남기면 리뷰·판정 없이"
+              f" 드라이버가 초안으로 `git commit --allow-empty` 한다. 시각 대조 산출물 등 파일을 바꿨으면 위처럼 스테이지한다."
+              if box.prefix == "verify" else "")
     return f"""# {c['pkg']}#{c['n']} 구현 — {c['title']}
 
 티켓 {c['pkg']} ({c['jira']}) 의 체크박스 **{c['n']}번 하나**를 구현한다. 커밋 하나 = 체크박스 하나다.
@@ -72,7 +76,7 @@ def impl(cfg, design, ticket, box, worktree, work, tc_rows=""):
 ## 할 일
 
 1. 이 체크박스 범위만 구현한다. 다음 체크박스의 일을 당겨 하지 않는다. 테스트 커밋이면 테스트만 쓰고 빨강을 확인한다.
-2. 변경을 `git add` 로 **스테이지에 올리고 커밋하지 않는다.** 리뷰는 스테이지 상태로 받는다.
+2. 변경을 `git add` 로 **스테이지에 올리고 커밋하지 않는다.** 리뷰는 스테이지 상태로 받는다.{verify}
 3. 커밋 메시지 초안을 `{p['draft']}` 에 쓴다. 첫 줄은 정확히 `{c['subject']}` 이다. 본문에 바꾼 것과 검증한 것을 적는다.
 4. 관련 테스트를 돌리고 결과(통과·실패 수, 실패 이름)를 `{p['test']}` 에 적는다.
 5. `worker_done` — 스테이지 파일 수 · 초안 경로 · 테스트 결과 한 줄.

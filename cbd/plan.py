@@ -5,7 +5,7 @@ top: project, driver, generated_at, design_root, design_commit, coordinator_sess
      scheduler_terminal, tickets[], extra_worktrees[]
 ticket: package, jira, repo, predecessors, chain_position, chain_length, hold, max_parallel, status,
         driver_terminal, driver_terminal_handle, run_id, boxes_total, boxes_done, sessions[], worktree{}, tc_plan[]
-session: key, box, kind, agent, model, status (planned·created·spawned·done), task_id, deps, title
+session: key, box, kind, agent, model, status (planned·created·spawned·done·skipped), task_id, deps, title
 """
 
 from cbd import boxes as B
@@ -26,6 +26,8 @@ def session_status(st, row):
     c = next((c for c in st.get("checkboxes") or [] if c["index"] == row["box"]), None)
     if not c:
         return "planned"
+    if row["kind"] in (c.get("skipped") or {}):
+        return "skipped"
     if c.get("phase") == "done":
         return "done"
     if c.get("phase") == "deferred":

@@ -5,6 +5,8 @@
   - `chore` that pins the front-common submodule to the producer's verified head (title mentions 핀/pin).
 - agent box: everything else — implement (staged, not committed) -> reviewers in parallel -> judge in the
   implementing terminal, which commits. UI tickets' verify is an agent box (it includes the one-scene comparison).
+  An agent `verify` whose implementer staged nothing (tests only) skips reviewers and judge; the driver commits the
+  draft --allow-empty.
 
 Session keys are the Orca task titles and the plan.json `key`: "<PKG>#<n> <역할> <이름>", which the dashboard
 matches by title when a plan row has no task id yet.

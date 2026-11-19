@@ -48,6 +48,9 @@ status: active
   재기동 때 옛 드라이버 터미널을 닫는다. 드라이버의 예상 밖 예외는 `멈춤 [드라이버 오류]` 로 남긴다.
 - 체크박스: `verify`(UI 티켓 제외)와 핀 `chore` 는 드라이버가 직접 커밋한다. 나머지는 구현 → 리뷰어 병렬(기본 Codex·Claude)
   → 같은 구현 터미널에서 판정·커밋. 커밋 제목 = `[Jira] <체크박스>`, 커밋 뒤 작업 트리가 깨끗해야 한다.
+  에이전트가 도는 `verify`(UI 티켓·`agent_box_overrides`)가 스테이지 없이 `test-result.md`·초안만 남기면 리뷰·판정을
+  건너뛰고(태스크는 completed, plan 은 skipped) 드라이버가 초안으로 `--allow-empty` 커밋한다. 그 밖의 박스는 스테이지가
+  없으면 정체다.
   판정은 `worker-start --task <판정> --terminal <구현 터미널> --worktree path:<워크트리>` 로 구현 터미널에 넣는다(끝난
   dispatch 가 잡은 터미널은 `dispatch --to` 로는 거부된다). 터미널이 닫혔거나 재사용이 어떤 이유로든 거부되면 그 사유를 로그에
   남기고 새 세션(`impl` 모델)으로 판정한다. 체크박스가 커밋되면 구현 터미널을 닫는다.
