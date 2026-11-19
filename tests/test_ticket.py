@@ -109,7 +109,8 @@ class FakeOrca:
         return None
 
     def worktree_create(self, repo, branch, base):
-        sh(self.repo, "git", "checkout", "-q", "-b", branch)
+        self.created_from = base
+        sh(self.repo, "git", "checkout", "-q", "-b", branch, base)
         return self.repo
 
 
@@ -122,10 +123,14 @@ class TicketTest(unittest.TestCase):
         sh(self.repo, "git", "config", "user.email", "t@example.com")
         sh(self.repo, "git", "config", "user.name", "t")
         sh(self.repo, "git", "commit", "-q", "--allow-empty", "-m", "base")
+        self.origin = os.path.join(self.home, "origin.git")
+        sh(self.home, "git", "init", "-q", "--bare", "-b", "main", self.origin)
+        sh(self.repo, "git", "remote", "add", "origin", self.origin)
+        sh(self.repo, "git", "push", "-q", "origin", "main")
         os.makedirs(os.path.join(self.home, "ex"))
         with open(os.path.join(self.home, "ex", "config.json"), "w") as f:
             json.dump({"project": "EX", "design_root": FIXTURE, "notify": False, "usage": {"commands": {}},
-                       "repos": {"core": {"test_cmd": ["true", "{tcs}"]}}}, f)
+                       "repos": {"core": {"path": self.repo, "test_cmd": ["true", "{tcs}"]}}}, f)
         self.cfg = Config("ex", self.home)
         self.design = Design(FIXTURE)
         self.store = Store(self.cfg)
@@ -160,6 +165,36 @@ class TicketTest(unittest.TestCase):
         a1 = next(t for t in plan["tickets"] if t["package"] == "A1")
         self.assertEqual((a1["boxes_done"], a1["status"]), (3, "verified"))
         self.assertTrue(all(s["status"] == "done" for s in a1["sessions"]))
+
+    def advance_origin(self):
+        """origin/main gains a commit the local main does not have (a checkout nobody pulled)."""
+        other = os.path.join(self.home, "other")
+        sh(self.home, "git", "clone", "-q", self.origin, other)
+        sh(other, "git", "-c", "user.email=o@example.com", "-c", "user.name=o", "commit", "-q", "--allow-empty",
+           "-m", "upstream")
+        sh(other, "git", "push", "-q", "origin", "main")
+        return sh(other, "git", "rev-parse", "HEAD")
+
+    def test_repo_base_starts_from_fetched_origin_not_stale_local_branch(self):
+        upstream = self.advance_origin()
+        fake = FakeOrca(self.repo)
+        self.assertEqual(self.drive(fake), 0)
+        st = self.store.ticket("A1")
+        self.assertEqual(fake.created_from, upstream)
+        self.assertEqual(st["base"], {"ref": "main", "sha": upstream, "from": None})
+        self.assertEqual(st["base_sha"], upstream)
+        log = sh(self.repo, "git", "log", "--format=%s", f"{upstream}..HEAD").splitlines()
+        self.assertEqual(len(log), 3)
+
+    def test_reused_worktree_without_the_base_blocks(self):
+        self.advance_origin()
+        sh(self.repo, "git", "checkout", "-q", "-b", "EX-1-A1-model")  # left over from a stale start
+        fake = FakeOrca(self.repo)
+        fake.worktree_for_branch = lambda b: self.repo
+        self.assertEqual(self.drive(fake), 2)
+        exc = self.store.ticket("A1")["exceptions"][-1]
+        self.assertEqual(exc["kind"], "환경")
+        self.assertIn("포함하지 않는다", exc["message"])
 
     def test_failed_reviewer_with_findings_file_is_accepted(self):
         self.assertEqual(self.drive(FakeOrca(self.repo, {"review": "fail-with-file"})), 0)

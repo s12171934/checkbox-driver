@@ -117,13 +117,17 @@ class TicketDriver:
         base, problem = base_for(self.design, states, self.cfg, self.pkg)
         if problem:
             raise DriverError("환경", problem)
+        if not base.get("sha"):  # a repo base: the local branch of that name may be months behind origin
+            base = dict(base, sha=self.fetch_base(repo, base["ref"]))
         path = orca.worktree_for_branch(t.branch)
         if path:
+            if run(["git", "-C", path, "merge-base", "--is-ancestor", base["sha"], "HEAD"]).returncode != 0:
+                raise DriverError("환경", f"재사용할 워크트리 {path} 의 HEAD 가 베이스 {base['ref']} @{base['sha'][:10]} 를 "
+                                        "포함하지 않는다 — 변경이 없으면 베이스로 reset, 있으면 리베이스한 뒤 재기동")
             self.log(f"워크트리 재사용 {path}")
         else:
-            ref = base.get("sha") or base["ref"]
-            path = orca.worktree_create(repo.get("orca_repo") or t.repo, t.branch, ref)
-            self.log(f"워크트리 생성 {path} (베이스 {base['ref']}{' @' + base['sha'][:10] if base.get('sha') else ''})")
+            path = orca.worktree_create(repo.get("orca_repo") or t.repo, t.branch, base["sha"])
+            self.log(f"워크트리 생성 {path} (베이스 {base['ref']} @{base['sha'][:10]})")
         st.update(worktree=path, branch=t.branch, base=base, base_sha=git(path, "rev-parse", "HEAD"),
                   started_at=st.get("started_at") or now_iso())
         if not st.get("checkboxes"):
@@ -135,6 +139,19 @@ class TicketDriver:
             if r.returncode != 0:
                 raise DriverError("환경", f"준비 명령 실패 `{cmd}`: {(r.stderr or r.stdout).strip()[-300:]}")
         self.jira.transition(t.jira, (self.cfg["jira"] or {}).get("progress_status"))
+
+    def fetch_base(self, repo, ref):
+        """sha of origin/<ref> right after fetching it, in the repo's own checkout."""
+        name = self.t.repo
+        src = repo.get("path") or orca.repo_path(repo.get("orca_repo") or name)
+        if not src:
+            raise DriverError("환경", f"저장소 {name} 의 로컬 경로를 모른다 — config repos.{name}.path")
+        branch = ref.removeprefix("origin/")
+        r = run(["git", "-C", src, "fetch", "-q", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}"],
+                timeout=600)
+        if r.returncode != 0:
+            raise DriverError("환경", f"git fetch origin {branch} 실패 ({src}): {(r.stderr or r.stdout).strip()[-300:]}")
+        return git(src, "rev-parse", f"refs/remotes/origin/{branch}^{{commit}}")
 
     def ensure_run(self):
         rid = self.st.get("run_id")

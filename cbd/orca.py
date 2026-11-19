@@ -79,6 +79,14 @@ def terminal_close(handle):
 
 
 # ---- worktrees
+def repo_path(name):
+    """Local checkout path of the Orca repo named `name`, or None."""
+    for r in call("repo", "list").get("repos") or []:
+        if r.get("displayName") == name:
+            return r.get("path")
+    return None
+
+
 def worktree_for_branch(branch):
     try:
         res = call("worktree", "list")

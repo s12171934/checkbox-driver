@@ -37,6 +37,9 @@ status: active
 
 - 착수는 DAG 선행(ticket-index 「선행」)이 모두 verified 일 때. 베이스는 체인에서 가장 가까운 verified 티켓의 verified 헤드,
   없으면 저장소 베이스. verified 가 체인의 접두사가 아니면 그 체인을 멈춘다.
+- 저장소 베이스는 착수 때 그 저장소에서 `git fetch origin <ref>` 한 `origin/<ref>` sha 로 워크트리를 만든다(로컬 같은 이름
+  브랜치는 쓰지 않는다). 같은 브랜치 워크트리를 재사용할 때 HEAD 가 베이스를 포함하지 않으면 멈춘다. 저장소 경로는
+  `repos.<이름>.path`, 없으면 Orca 저장소 목록.
 - 동시 상한 `max_parallel`(기본 12), 기동 뒤 300초 중복 방지, 죽은 드라이버 재기동 3회까지.
 - 체크박스: `verify`(UI 티켓 제외)와 핀 `chore` 는 드라이버가 직접 커밋한다. 나머지는 구현 → 리뷰어 병렬(기본 Codex·Claude)
   → 같은 구현 터미널에서 판정·커밋. 커밋 제목 = `[Jira] <체크박스>`, 커밋 뒤 작업 트리가 깨끗해야 한다.
