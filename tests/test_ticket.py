@@ -77,6 +77,20 @@ class FakeOrca:
                                 "terminal": terminal or f"h_{tid}"})
         self.tasks[tid]["status"] = "dispatched"
         work = self._work(spec)
+        if "누적검증" in key:
+            n = int(key.split("#")[1].split()[0])
+            problems = self.behaviour.get("cumulative_problems", {}).get(n, 0)
+            with open(os.path.join(work, f"{n:02d}.md"), "w") as f:
+                f.write(f"판정: 문제 {problems}\n\n### 1. 계약 어긋남\n" if problems else "판정: 문제 없음\n")
+            self.tasks[tid]["status"] = "completed"
+            return {"dispatch": d, "handle": terminal or f"h_{tid}"}
+        if "통합 리뷰" in key:
+            name = key.split()[-1]
+            n = self.behaviour.get("integration_findings", {}).get(name, 0)
+            with open(os.path.join(work, f"findings-{name}.md"), "w") as f:
+                f.write(f"판정: 지적 {n}\n\n## 지적\n\n### 1. 정본 중복\n" if n else "판정: 지적 없음\n")
+            self.tasks[tid]["status"] = "completed"
+            return {"dispatch": d, "handle": terminal or f"h_{tid}"}
         if "구현" in key:
             n = key.split("#")[1].split()[0]
             if int(n) not in self.behaviour.get("no_stage", ()):
@@ -196,8 +210,13 @@ class TicketTest(unittest.TestCase):
         self.assertEqual(log, ["[EX-1] verify: A1 테스트 그린", "[EX-1] feat(core): 모델 추가",
                                "[EX-1] test(core): TC-A-01~TC-A-03 빨강"])
         self.assertEqual(st["verified_head"], sh(self.repo, "git", "rev-parse", "HEAD"))
-        # 2 agent boxes x (impl + 2 reviews + judge) precreated, driver verify has no task
-        self.assertEqual(len(fake.tasks), 8)
+        # 2 agent boxes x (impl + 2 reviews + judge) + 2 integration reviews precreated, driver verify has no task;
+        # a cumulative check per commit that changed files (the empty verify commit has none)
+        self.assertEqual(len(fake.tasks), 12)
+        self.assertEqual([k for k in fake.started if "누적검증" in k], ["A1#1 누적검증 codex", "A1#2 누적검증 codex"])
+        self.assertEqual(fake.started[-2:], ["A1#통합 리뷰 codex", "A1#통합 리뷰 claude"])
+        self.assertEqual(st["integration"]["phase"], "done")
+        self.assertEqual({k: v["problems"] for k, v in st["cumulative"].items()}, {"1": 0, "2": 0})
         self.assertEqual(fake.started[:3], ["A1#1 구현 claude", "A1#1 리뷰 codex", "A1#1 리뷰 claude"])
         # the judge is started on the implementing terminal with worker-start --terminal, not dispatch --inject
         impl_task = next(t for t, (k, _) in fake.titles.items() if k == "A1#1 구현 claude")
@@ -310,7 +329,10 @@ class TicketTest(unittest.TestCase):
         self.assertEqual(self.drive(fake), 0, self.store.ticket("A1").get("exceptions"))
         reviews = [m for m in models if "리뷰" in m[0]]
         self.assertEqual(reviews, [("A1#1 리뷰 codex", "gpt-6.1-sol"), ("A1#1 리뷰 claude", "claude-opus-5-5"),
-                                   ("A1#2 리뷰 codex", "m2"), ("A1#2 리뷰 gemini", "g1")])
+                                   ("A1#2 리뷰 codex", "m2"), ("A1#2 리뷰 gemini", "g1"),
+                                   ("A1#통합 리뷰 codex", "m2"), ("A1#통합 리뷰 gemini", "g1")])
+        dropped_int = next(t for t, (k, _) in fake.titles.items() if k == "A1#통합 리뷰 claude")
+        self.assertEqual(fake.tasks[dropped_int]["status"], "completed")
         dropped = next(t for t, (k, _) in fake.titles.items() if k == "A1#2 리뷰 claude")
         self.assertEqual(fake.tasks[dropped]["status"], "completed")  # the dropped reviewer's task is closed
         self.assertEqual(self.store.ticket("A1")["status"], "verified")
@@ -441,7 +463,8 @@ class TicketTest(unittest.TestCase):
         fake = FakeOrca(self.repo)
         self.assertEqual(self.drive(fake), 0)
         self.assertEqual([k for k in fake.started if k.startswith("A1#3")],
-                         ["A1#3 구현 claude", "A1#3 리뷰 codex", "A1#3 리뷰 claude", "A1#3 판정 claude"])
+                         ["A1#3 구현 claude", "A1#3 리뷰 codex", "A1#3 리뷰 claude", "A1#3 판정 claude",
+                          "A1#3 누적검증 codex"])
         self.assertNotIn("skipped", next(c for c in self.store.ticket("A1")["checkboxes"] if c["index"] == 3))
 
     def test_verify_impl_brief_allows_no_stage(self):
@@ -647,6 +670,70 @@ class TicketTest(unittest.TestCase):
         self.store.approve("A1", 2)
         self.assertEqual(self.drive(FakeOrca(self.repo)), 0)
 
+    def test_integration_findings_add_a_fix_checkbox_then_remeasure(self):
+        fake = FakeOrca(self.repo, {"integration_findings": {"codex": 2}})
+        self.assertEqual(self.drive(fake), 0, self.store.ticket("A1").get("exceptions"))
+        st = self.store.ticket("A1")
+        self.assertEqual(st["status"], "verified")
+        fix = st["checkboxes"][-1]
+        self.assertEqual((fix["index"], fix["fix_source"], fix["phase"]), (4, "integration", "done"))
+        self.assertEqual(sh(self.repo, "git", "log", "-1", "--format=%s"), "[EX-1] fix: 티켓 통합 리뷰 지적 반영")
+        self.assertEqual((st["integration"]["phase"], st["integration"]["findings"]), ("done", {"codex": 2}))
+        self.assertIn("remeasure", st["integration"]["remeasured"])
+        # the fix implementer is pointed at the integration findings; the review is not run a second time
+        brief = _read(os.path.join(self.cfg.work_dir, "A1", "04", "impl-brief.md"))
+        self.assertIn(os.path.join("A1", "통합", "findings-codex.md"), brief)
+        self.assertEqual(sum(1 for k in fake.started if "통합 리뷰" in k), 2)
+        self.assertEqual([a["kind"] for a in self.alerts()], ["integration"])
+
+    def test_cumulative_problem_alerts_the_coordinator_without_stopping(self):
+        fake = FakeOrca(self.repo, {"cumulative_problems": {2: 3}})
+        self.assertEqual(self.drive(fake), 0)
+        st = self.store.ticket("A1")
+        self.assertEqual(st["status"], "verified")
+        alerts = [a for a in self.alerts() if a["kind"] == "cumulative"]
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual((alerts[0]["problems"], alerts[0]["commit"]), (3, st["checkboxes"][1]["commit"]))
+        self.assertIn("계약 어긋남", alerts[0]["summary"])
+        brief = _read(os.path.join(self.cfg.work_dir, "A1", "cumulative", "02-brief.md"))
+        self.assertIn(f"git diff {st['base_sha']}..{st['checkboxes'][1]['commit']}", brief)
+        self.assertIn("작업 트리 파일을 읽지 말고", brief)
+
+    def test_cumulative_check_can_be_turned_off(self):
+        conf = json.loads(_read(self.cfg.path))
+        with open(self.cfg.path, "w") as f:
+            json.dump({**conf, "cumulative_check": {"enabled": False}, "integration_review": False}, f)
+        self.cfg = Config("ex", self.home)
+        self.store = Store(self.cfg)
+        fake = FakeOrca(self.repo)
+        self.assertEqual(self.drive(fake), 0)
+        self.assertFalse([k for k in fake.started if "누적검증" in k or "통합" in k])
+        self.assertEqual(len(fake.tasks), 8)
+
+
+    def test_codex_integration_review_of_a_ui_ticket_compares_storybook_with_figma(self):
+        from cbd import briefs
+        conf = json.loads(_read(self.cfg.path))
+        with open(self.cfg.path, "w") as f:
+            json.dump({**conf, "ui_tickets": ["A1"]}, f)
+        self.cfg = Config("ex", self.home)
+        t = self.design.tickets["A1"]
+        goals = ["교사 화면이 https://www.figma.com/design/KEY/x?node-id=1-2 와 같다"]
+        codex = briefs.integration_review(self.cfg, self.design, t, self.repo, self.home, "codex", "abc", goals)
+        claude = briefs.integration_review(self.cfg, self.design, t, self.repo, self.home, "claude", "abc", goals)
+        self.assertIn("UI 대조 — Storybook ↔ Figma", codex)
+        self.assertIn("Figma MCP 로 프레임을 직접 조회", codex)  # no snapshot dir -> the Figma file itself
+        self.assertIn("- https://www.figma.com/design/KEY/x?node-id=1-2", codex)
+        self.assertNotIn("UI 대조", claude)
+        snap = os.path.join(self.home, "design")
+        shutil.copytree(FIXTURE, snap)
+        os.makedirs(os.path.join(snap, "snapshots", "A1"))
+        with_snap = briefs.integration_review(self.cfg, Design(snap), Design(snap).tickets["A1"], self.repo, self.home,
+                                              "codex", "abc", goals)
+        self.assertIn("디자인 스냅숏(정본)", with_snap)
+        a2 = briefs.integration_review(self.cfg, self.design, self.design.tickets["A2"], self.repo, self.home,
+                                       "codex", "abc", goals)
+        self.assertNotIn("UI 대조", a2)  # not a UI ticket
 
 if __name__ == "__main__":
     unittest.main()

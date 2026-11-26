@@ -1,6 +1,11 @@
 """The ticket driver: `cbd <project> run <PKG>`, one process per ticket in its own Orca terminal.
 
-start_ticket -> ensure_run -> precreate_tasks -> process_checkbox x N -> finish_ticket
+start_ticket -> ensure_run -> precreate_tasks -> process_checkbox x N -> integration_review
+  [-> fix checkbox -> remeasure] -> finish_ticket
+
+Beside the loop, every commit starts a cumulative check (one GPT session over base..commit) that the loop does not wait
+for; its problems go to the coordinator as alerts (state/alerts.jsonl kind 「cumulative」). The driver waits for the
+outstanding checks only before verified, and their problems never stop the ticket.
 
 Every step is resumable: the checkbox record keeps its phase, task ids, dispatches and finished roles, so a restarted
 driver continues where the last one stopped (a worker_done received before a restart is read back from the task
@@ -59,9 +64,40 @@ class TicketDriver:
         return next(c for c in self.st["checkboxes"] if c["index"] == n)
 
     def work(self, n):
-        d = os.path.join(self.cfg.work_dir, self.pkg, f"{n:02d}")
+        d = os.path.join(self.cfg.work_dir, self.pkg, n if isinstance(n, str) else f"{n:02d}")
         os.makedirs(d, exist_ok=True)
         return d
+
+    def integ(self):
+        """The integration review record (None when the review is off), shaped like a checkbox record."""
+        if not B.integration_enabled(self.cfg):
+            return self.st.get("integration")
+        return self.st.setdefault("integration", {"index": B.INTEGRATION, "phase": "pending"})
+
+    def rec(self, box):
+        return self.integ() if box == B.INTEGRATION else self.box(box)
+
+    def records(self):
+        ig = self.st.get("integration")
+        return list(self.st.get("checkboxes") or []) + ([ig] if ig else [])
+
+    def goals(self):
+        """The ticket's 검증 목표: the design's, else the Jira body's 「검증 목표」 section (read once, kept in state)."""
+        g = self.st.get("goals")
+        if g is not None:
+            return g["items"]
+        items, source = list(self.t.goals), "design"
+        if not items and self.jira.enabled and self.t.jira:
+            try:
+                items, source = self.jira.goals(self.t.jira), "jira"
+            except DriverError as e:
+                self.log(f"Jira 본문의 검증 목표를 읽지 못함 — {e.message[:200]}")
+        if not items:
+            source = "none"
+            self.log("검증 목표 없음 — 통합 리뷰·누적 검증은 기본 관점만 본다")
+        self.st["goals"] = {"items": items, "source": source}
+        self.save()
+        return items
 
     def notify(self, text):
         if self.cfg.get("notify", True):
@@ -110,11 +146,12 @@ class TicketDriver:
                 self.start_ticket()
                 self.ensure_run()
                 self.precreate_tasks()
-                for c in self.st["checkboxes"]:
-                    if c.get("phase") in ("done", "deferred"):
-                        continue
-                    self.reload_config(c)
-                    self.process_checkbox(c)
+                self.run_boxes()
+                if self.integration_review():
+                    self.precreate_tasks()
+                    self.run_boxes()
+                self.remeasure()
+                self.collect_cumulative(wait=True)
                 self.finish_ticket()
                 return
             except DriverError as e:
@@ -128,6 +165,15 @@ class TicketDriver:
                 failures += 1
                 self.log(f"일시 오류 — {delay}초 뒤 같은 단계 재시도 {failures}/{len(RETRY_DELAYS)}: {e.message[:300]}")
                 time.sleep(delay)
+
+    def run_boxes(self):
+        for c in list(self.st["checkboxes"]):
+            if c.get("phase") in ("done", "deferred"):
+                continue
+            self.reload_config(c)
+            self.process_checkbox(c)
+            self.start_cumulative(c)
+            self.collect_cumulative()
 
     def block(self, e):
         self.st.setdefault("exceptions", []).append({"kind": e.kind, "message": e.message, "at": now_iso(),
@@ -233,11 +279,14 @@ class TicketDriver:
                 return
             except orca.OrcaError as e:
                 self.log(f"Run {rid} 을 이어 쓸 수 없다 ({e.code or e.message[:60]}) — 새 Run 으로 다시 등록")
-                for c in self.st["checkboxes"]:
-                    if c.get("phase") != "done":
+                for c in self.records():
+                    if c.get("phase") not in ("done", "skipped"):
                         c.pop("tasks", None)
                         c.pop("dispatch", None)
                         c.pop("done", None)
+                for c in (self.st.get("cumulative") or {}).values():
+                    if c.get("phase") == "running":  # started again in the new Run
+                        c.update(phase="gated", tasks={}, dispatch={})
         rid = orca.run_create(f"{self.cfg['project']} {self.pkg} 체크박스 드라이버")
         self.st["run_id"] = rid
         self.store.save_run(self.pkg, rid, self.handle)
@@ -251,11 +300,11 @@ class TicketDriver:
         """Every agent session of the ticket becomes an Orca task up front, with deps (방식 절차 4: 워커 생성 계획)."""
         rid, key_to_task = self.st["run_id"], {}
         known = orca.task_list(rid)
-        for c in self.st["checkboxes"]:  # a task the Run no longer has is created again (unless that role finished)
+        for c in self.records():  # a task the Run no longer has is created again (unless that role finished)
             for k in [k for k, tid in (c.get("tasks") or {}).items() if tid not in known and not (c.get("done") or {}).get(k)]:
                 c["tasks"].pop(k)
                 (c.get("dispatch") or {}).pop(k, None)
-        for c in self.st["checkboxes"]:  # a done checkbox may keep ids of an old Run; Orca refuses deps across Runs
+        for c in self.records():  # a done checkbox may keep ids of an old Run; Orca refuses deps across Runs
             for k, tid in (c.get("tasks") or {}).items():
                 if tid in known:
                     key_to_task[(c["index"], k)] = tid
@@ -263,11 +312,15 @@ class TicketDriver:
         by_key = {r["key"]: r for r in rows}
         created = 0
         for r in rows:
-            c = self.box(r["box"])
-            if r["kind"] == "driver" or c.get("phase") in ("done", "deferred") or (c.get("tasks") or {}).get(r["kind"]):
+            c = self.rec(r["box"])
+            if r["kind"] == "driver" or c.get("phase") in ("done", "deferred", "skipped", "fix") or \
+                    (c.get("tasks") or {}).get(r["kind"]):
                 continue
-            box = next(b for b in self._boxes() if b.index == r["box"])
-            spec = self.write_brief(c, box, r["kind"])
+            if r["box"] == B.INTEGRATION:
+                spec = self.write_integration_brief(r["kind"].removeprefix("review-"))
+            else:
+                box = next(b for b in self._boxes() if b.index == r["box"])
+                spec = self.write_brief(c, box, r["kind"])
             deps = [key_to_task.get((by_key[d]["box"], by_key[d]["kind"])) for d in r["deps"] if d in by_key]
             tid = orca.task_create(rid, r["key"], spec, [d for d in deps if d])
             c.setdefault("tasks", {})[r["kind"]] = tid
@@ -285,12 +338,27 @@ class TicketDriver:
             rows = briefs.tc_rows_text(self.design, tcs) if tcs else ""
             if rows:
                 write_text(os.path.join(work, "tc-rows.md"), rows + "\n")
-            text = briefs.impl(self.cfg, self.design, self.t, box, wt, work, rows)
+            text = briefs.impl(self.cfg, self.design, self.t, box, wt, work, rows, extra=self.fix_extra(c))
         elif kind == "judge":
             text = briefs.judge(self.cfg, self.design, self.t, box, wt, work)
         else:
-            text = briefs.review(self.cfg, self.design, self.t, box, wt, work, kind.removeprefix("review-"))
+            text = briefs.review(self.cfg, self.design, self.t, box, wt, work, kind.removeprefix("review-"),
+                                 extra=self.fix_extra(c, review=True))
         path = os.path.join(work, f"{kind}-brief.md")
+        write_text(path, text)
+        return path
+
+    def fix_extra(self, c, review=False):
+        if c.get("fix_source") != "integration":
+            return ""
+        files = [briefs.integration_path(self.work(B.INTEGRATION), r) for r in (self.integ() or {}).get("findings", {})]
+        return briefs.fix_extra(files, self.goals(), review=review)
+
+    def write_integration_brief(self, name):
+        work = self.work(B.INTEGRATION)
+        text = briefs.integration_review(self.cfg, self.design, self.t, self.st["worktree"], work, name,
+                                         self.st.get("base_sha") or "HEAD", self.goals())
+        path = os.path.join(work, f"review-{name}-brief.md")
         write_text(path, text)
         return path
 
@@ -316,6 +384,11 @@ class TicketDriver:
             box["kind"] = B.kind(self.cfg, self.t, boxes[box["index"]])
             for kind in [k for k in (box.get("tasks") or {}) if (box["index"], k) not in kinds]:
                 orca.task_update(self.st["run_id"], box["tasks"].pop(kind), "completed",
+                                 "cbd: 건너뜀 — config.json 변경으로 빠진 세션")
+        ig = self.st.get("integration")
+        if ig and not ig.get("dispatch") and ig.get("phase") == "pending":  # the review has not started: follow config
+            for kind in [k for k in (ig.get("tasks") or {}) if (B.INTEGRATION, k) not in kinds]:
+                orca.task_update(self.st["run_id"], ig["tasks"].pop(kind), "completed",
                                  "cbd: 건너뜀 — config.json 변경으로 빠진 세션")
         self.save()
         self.precreate_tasks()
@@ -587,6 +660,8 @@ class TicketDriver:
             if now_ts() - started > int(self.cfg["quiet_limit_sec"]) and not self._has_open_question():
                 raise DriverError("정체", f"#{c['index']} {kind} 가 {int(self.cfg['quiet_limit_sec']) // 60}분 동안 끝나지 않았다")
             self.pump(rid)
+            if kind != "cumulative":
+                self.collect_cumulative()
 
     def worker_gone(self, c, kind):
         """Why the worker of a not-yet-finished task is gone (exited or lost without worker_done), or None."""
@@ -631,6 +706,196 @@ class TicketDriver:
                     orca.task_update(rid, m.group(1), "completed", f.read().strip())
                 write_text(os.path.join(d, name + ".sent"), now_iso())
 
+    # ---- ticket integration review (체크박스를 넘는 검증 §3)
+    def integration_review(self):
+        """Every reviewer reads the whole branch once against the 검증 목표. Findings add one fix checkbox at the end
+        (returns True); none -> the review is done. Not while a checkbox is deferred (the ticket is not finished)."""
+        ig = self.integ()
+        if not ig or not B.integration_enabled(self.cfg) or ig.get("phase") in ("done", "skipped", "fix"):
+            return False
+        if any(c.get("phase") == "deferred" for c in self.st["checkboxes"]):
+            return False
+        self.precreate_tasks()
+        work = self.work(B.INTEGRATION)
+        done, disp = ig.setdefault("done", {}), ig.setdefault("dispatch", {})
+        pending = [r for r in self.cfg["reviewers"] if not done.get(f"review-{r['name']}")]
+        if pending:
+            if ig.get("phase") == "pending":
+                self.log(f"티켓 통합 리뷰 시작 — 검증 목표 {len(self.goals())}개, {self.st.get('base_sha', '')[:10]}..HEAD")
+            ig["phase"] = "reviewing"
+            ig.setdefault("notes", []).extend(self.gate.wait(sorted({r.get("pool", r["agent"]) for r in pending}),
+                                                             "통합 리뷰"))
+            for r in pending:
+                if not disp.get(f"review-{r['name']}"):
+                    self.launch(ig, f"review-{r['name']}")
+            for r in pending:
+                self.wait_task(ig, f"review-{r['name']}", accept_file=briefs.integration_path(work, r["name"]))
+            for d in disp.values():
+                if d:
+                    orca.worker_release(d)
+        counts = {r["name"]: integration_count(briefs.integration_path(work, r["name"])) for r in self.cfg["reviewers"]}
+        ig["findings"] = {k: v for k, v in counts.items() if v}
+        ig["head"] = git(self.st["worktree"], "rev-parse", "HEAD")
+        total = sum(counts.values())
+        if not total:
+            ig.update(phase="done", finished_at=now_iso())
+            self.save()
+            self.log("티켓 통합 리뷰 지적 0 — 완료 처리로")
+            return False
+        n = max(c["index"] for c in self.st["checkboxes"]) + 1 if self.st["checkboxes"] else 1
+        title = self.cfg.get("integration_fix_title") or "fix: 티켓 통합 리뷰 지적 반영"
+        self.st["checkboxes"].append({"index": n, "title": title, "phase": "pending", "kind": B.AGENT,
+                                      "fix_source": "integration"})
+        ig.update(phase="fix", fix_box=n)
+        self.save()
+        self.log(f"티켓 통합 리뷰 지적 {total}건 ({', '.join(f'{k} {v}' for k, v in ig['findings'].items())}) — "
+                 f"수정 체크박스 #{n} 추가")
+        self.store.alert(self.pkg, "integration", f"티켓 통합 리뷰 지적 {total}건 — 수정 체크박스 #{n} 로 처리",
+                         findings=[briefs.integration_path(work, k) for k in ig["findings"]])
+        try:
+            self.jira.add_box(self.t.jira, title)
+        except DriverError as e:
+            self.log(f"Jira 체크리스트에 #{n} 추가 실패 — {e.message}")
+        return True
+
+    def remeasure(self):
+        """After the integration fix commit: the completion tests and the type check again, measured only (no commit).
+        A red run stops the ticket — it is not verified."""
+        ig = self.st.get("integration") or {}
+        if ig.get("phase") != "fix":
+            return
+        c = self.box(ig["fix_box"])
+        if c.get("phase") != "done":
+            return
+        wt, rc = self.st["worktree"], self.cfg.repo(self.t.repo)
+        out, ok = [], True
+        if rc.get("test_cmd") and self.t.tcs:
+            res = self.run_cmd(rc["test_cmd"], self.t.tcs, wt, c, "remeasure")
+            out.append(res[1])
+            ok &= res[0]
+        if rc.get("typecheck_cmd"):
+            res = self.run_cmd(rc["typecheck_cmd"], [], wt, c, "remeasure-typecheck")
+            out.append(res[1])
+            ok &= res[0]
+        if not ok:
+            raise DriverError("검증 실패", "통합 리뷰 수정 뒤 재측정 — " + " / ".join(out))
+        ig.update(phase="done", remeasured=" / ".join(out) or "재측정 명령 없음", finished_at=now_iso())
+        self.save()
+        self.log(f"통합 리뷰 수정 뒤 재측정 — {ig['remeasured']}")
+
+    # ---- cumulative check: after every commit, GPT checks base..commit beside the loop
+    def cumulative_agent(self):
+        cc = self.cfg.get("cumulative_check") or {}
+        if not cc.get("enabled", True):
+            return None
+        if cc.get("agent"):
+            return cc
+        rs = self.cfg["reviewers"]
+        return next((r for r in rs if r["name"] == cc.get("reviewer", "codex")), None) or \
+            next((r for r in rs if r["agent"] == "codex"), None)
+
+    def start_cumulative(self, c, rec=None):
+        """Start the cumulative check of checkbox c's commit; a usage gate over the threshold leaves it 「gated」 for a
+        later boundary instead of holding the loop. Its failures are reported, never raised."""
+        agent = self.cumulative_agent()
+        commit = c.get("commit")
+        if not agent or not commit:
+            return
+        recs = self.st.setdefault("cumulative", {})
+        rec = rec or recs.get(str(c["index"]))
+        if rec and rec.get("phase") not in ("gated",):
+            return
+        wt = self.st["worktree"]
+        if not rec and run(["git", "-C", wt, "diff", "--quiet", f"{commit}^", commit]).returncode == 0:
+            return  # an empty commit (verify) changes nothing to check
+        rec = rec or {"index": c["index"], "title": c["title"], "commit": commit, "tasks": {}, "dispatch": {}}
+        recs[str(c["index"])] = rec
+        blocked, _, note = self.gate.blocked(agent.get("pool", agent["agent"]))
+        if blocked:
+            rec["phase"] = "gated"
+            self.save()
+            self.log(f"#{c['index']} 누적 검증 보류 — {note}")
+            return
+        work = self.work("cumulative")
+        try:
+            path = os.path.join(work, f"{c['index']:02d}-brief.md")
+            write_text(path, briefs.cumulative(self.cfg, self.design, self.t, wt, work, c["index"], c["title"],
+                                               self.st.get("base_sha") or f"{commit}^", commit, self.goals()))
+            rid = self.st["run_id"]
+            if not rec["tasks"].get("cumulative"):
+                rec["tasks"]["cumulative"] = orca.task_create(rid, f"{self.pkg}#{c['index']} 누적검증 {agent['name'] if 'name' in agent else agent['agent']}", path, [])
+            w = self.start_worker(rec, "cumulative", agent, f"{self.pkg}#{c['index']} 누적검증")
+            rec.update(phase="running", started_at=now_iso())
+            rec["dispatch"]["cumulative"] = w["dispatch"]
+            self.save()
+            self.log(f"#{c['index']} 누적 검증 시작 ({commit[:10]})")
+        except DriverError as e:
+            rec.update(phase="error", error=e.message[:300])
+            self.save()
+            self.log(f"#{c['index']} 누적 검증을 띄우지 못함 — {e.message[:200]}")
+            self.store.alert(self.pkg, "cumulative", f"#{c['index']} 누적 검증을 띄우지 못함 — {e.message}",
+                             commit=commit)
+
+    def collect_cumulative(self, wait=False):
+        """Read finished cumulative checks and alert the coordinator on problems; gated ones are started again.
+        wait=True (before verified) waits until none is left running."""
+        recs = self.st.get("cumulative") or {}
+        started = now_ts()
+        while True:
+            live = False
+            for rec in recs.values():
+                if rec.get("phase") == "gated":
+                    c = next((x for x in self.st["checkboxes"] if x["index"] == rec["index"]), rec)
+                    if wait:
+                        agent = self.cumulative_agent()
+                        if agent:
+                            self.gate.wait([agent.get("pool", agent["agent"])], f"#{rec['index']} 누적 검증")
+                    self.start_cumulative(c, rec)
+                if rec.get("phase") == "running":
+                    self.read_cumulative(rec)
+                live |= rec.get("phase") in ("running", "gated")
+            if not wait or not live:
+                return
+            if now_ts() - started > int(self.cfg["quiet_limit_sec"]) and not self._has_open_question():
+                for rec in recs.values():  # reported and given up on: they never hold verified
+                    if rec.get("phase") in ("running", "gated"):
+                        rec.update(phase="failed", finished_at=now_iso())
+                        self.store.alert(self.pkg, "cumulative", f"#{rec['index']} 누적 검증이 끝나지 않아 기다림을 멈춤",
+                                         commit=rec.get("commit"))
+                self.save()
+                return
+            self.pump(self.st["run_id"])
+
+    def read_cumulative(self, rec):
+        rid, tid = self.st["run_id"], rec["tasks"].get("cumulative")
+        status = orca.task_list(rid).get(tid, {}).get("status")
+        gone = status == "failed" or self.worker_gone(rec, "cumulative")
+        if status != "completed" and not gone:
+            return
+        n = rec["index"]
+        path = briefs.cumulative_path(self.work("cumulative"), n)
+        problems, first = cumulative_count(path)
+        if problems is None:
+            rec.update(phase="failed", finished_at=now_iso())
+            self.log(f"#{n} 누적 검증이 결과 파일 없이 끝났다 ({path})")
+            self.store.alert(self.pkg, "cumulative", f"#{n} 누적 검증이 결과를 남기지 않았다 — 다시 볼지 판단 필요",
+                             commit=rec["commit"], path=path)
+        else:
+            rec.update(phase="done", problems=problems, path=path, finished_at=now_iso())
+            if problems:
+                self.log(f"#{n} 누적 검증 문제 {problems}건 — 코디네이터에 알림 ({path})")
+                self.store.alert(self.pkg, "cumulative", f"#{n} `{rec['title'][:60]}` 까지의 누적 통합 검증에서 문제 "
+                                 f"{problems}건{(' — ' + first) if first else ''}", commit=rec["commit"], path=path,
+                                 problems=problems)
+                self.notify(f"{self.pkg}#{n} 누적 검증 문제 {problems}건")
+            else:
+                self.log(f"#{n} 누적 검증 문제 없음")
+        d = rec["dispatch"].get("cumulative")
+        if d:
+            orca.worker_release(d)
+        self.progress += 1
+        self.save()
+
     # ---- finish
     def finish_ticket(self):
         wt = self.st["worktree"]
@@ -653,6 +918,39 @@ class TicketDriver:
             self.log(f"Jira 완료 전이 실패 — {e.message}")
         self.log(f"verified {self.st['verified_head'][:10]} — 체크박스 {len(done)}개")
         self.notify(f"{self.pkg} verified")
+
+
+def integration_count(path):
+    """Number of findings from an integration findings file's first line (「판정: 지적 없음 | N」, or a bare 「없음」)."""
+    first = _first_line(path)
+    if first is None:
+        raise DriverError("정체", f"통합 리뷰 findings 가 없다 ({path})")
+    if first in ("없음", "판정: 없음"):
+        return 0
+    m = re.match(r"판정\s*[:：]\s*지적\s*(없음|\d+)", first)
+    if not m:
+        raise DriverError("정체", f"통합 리뷰 findings 첫 줄이 「판정: 지적 없음|N」 이 아니다 ({path}): {first[:80]}")
+    return 0 if m.group(1) == "없음" else int(m.group(1))
+
+
+def cumulative_count(path):
+    """(problems, first problem heading) of a cumulative check result; (None, '') when it has no readable first line."""
+    first = _first_line(path)
+    m = re.match(r"판정\s*[:：]\s*문제\s*(없음|\d+)", first or "")
+    if not m:
+        return None, ""
+    n = 0 if m.group(1) == "없음" else int(m.group(1))
+    with open(path, encoding="utf-8") as f:
+        head = next((l.lstrip("#").strip() for l in f if l.startswith("###")), "")
+    return n, head[:120]
+
+
+def _first_line(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return next((l.strip() for l in f if l.strip()), "")
+    except OSError:
+        return None
 
 
 def _norm(s):

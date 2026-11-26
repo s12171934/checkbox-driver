@@ -2,7 +2,8 @@
 
 Inputs (all under <design_root>):
 - plan/commits.md       ## <PKG> sections of "- [ ] `<commit title>`" lines — one checkbox = one commit.
-- plan/ticket-index.md  요약표 (티켓 · Jira? · 저장소 · 베이스 · 층 · 선행 · 체인 앞 · 핀) and per-ticket 「테스트:」 lines.
+- plan/ticket-index.md  요약표 (티켓 · Jira? · 저장소 · 베이스 · 층 · 선행 · 체인 앞 · 핀) and per-ticket 「테스트:」 lines
+                        and 「검증 목표:」 lists (what the ticket integration review checks the whole branch against).
 - plan/jira-map.md      트리 표 (키 · Jira · 브랜치?) — the Jira key of each package.
 - plan/order.md         완료 기준 tables and the 스택 체인 table (branch names per repo, in chain order).
 - tests/*.md            TC rows (ID or TC column, optional 층 column), used to expand layer-named criteria.
@@ -13,7 +14,9 @@ Section numbers move between projects, so sections are found by heading words an
 - 트리 table (티켓 · 저장소 · 브랜치 · 베이스/스택 부모 · 대상 테스트 · is blocked by) — the 티켓 cell starts with the
   Jira key; a base cell naming a package is the chain parent; a 「—」 branch marks a branchless verification ticket.
 - 스택 체인 table (저장소 · 체인 「`base` ← R1 `branch` ← R2 `branch`」)   chains and branch names.
-- 체크리스트 section: 「R1 — PSD-1 · `branch`」 then a ``` block of 「[ ] <commit title>」 lines (the 「[ ] 완료」 line is not a box).
+- 체크리스트 section: 「R1 — PSD-1 · `branch`」 then a ``` block of 「[ ] <commit title>」 lines (the 「[ ] 완료」 line is not a box);
+  a 「검증 목표:」 list between that line and the next ticket's line is the ticket's verification goals.
+- 「티켓 · 검증 목표」 table (e.g. 「티켓별 검증 목표」): one goal per ticket without a 「검증 목표:」 list.
 - 테스트 케이스 section: TC rows, as tests/*.md.
 
 Column positions differ between projects, so every table is read by its header names.
@@ -96,6 +99,37 @@ def section(text, words):
     return "", ""
 
 
+GOALS_RE = re.compile(r"^(\s*)(- |\* )?\**검증 목표\**\s*[:：]\s*(.*)$")
+ITEM_RE = re.compile(r"^(\s*)(?:[-*]|\d+[.)])\s+(.+?)\s*$")
+
+
+def goals_in(text):
+    """The 「검증 목표:」 list of a ticket's text -> [goal]. An inline remainder is the one goal (the lines after it are
+    other fields); otherwise the list items under the line — indented ones when the marker is itself a list item,
+    top-level ones too when it is not."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        m = GOALS_RE.match(line)
+        if not m:
+            continue
+        indent, bullet = len(m.group(1)), bool(m.group(2))
+        inline = m.group(3).strip()
+        if inline:
+            return [] if inline in DASH else [inline]
+        out = []
+        for nxt in lines[i + 1:]:
+            if not nxt.strip():
+                if out:
+                    break
+                continue
+            it = ITEM_RE.match(nxt)
+            if not it or (bullet and len(it.group(1)) <= indent):
+                break
+            out.append(it.group(2))
+        return out
+    return []
+
+
 def strip_md(cell):
     cell = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", cell)
     return cell.replace("`", "").strip()
@@ -127,6 +161,7 @@ class Box:
         self.title = title        # the commit title, verbatim
         self.checked = checked
         self.note = note          # text after the closing backtick, e.g. '(데스크톱)'
+        self.fix_source = ""      # 'integration' for the fix checkbox the ticket integration review added
 
     @property
     def prefix(self):
@@ -152,6 +187,7 @@ class Ticket:
         self.criteria = ""        # 완료 기준 text from order.md
         self.index_section = ""   # the ticket's ### section of ticket-index.md (읽을 노드 목록) — goes into briefs
         self.index_tests = ""     # its 「테스트:」 line, the fallback when order.md has no 완료 기준
+        self.goals = []           # 「검증 목표:」 items — what the ticket integration review checks the branch against
         self.tcs = []
         self.verification_only = False  # single-doc 「—」 branch: a checklist of checks, not commits — never driven
         self.chain_position = 0
@@ -172,6 +208,7 @@ class Design:
         self.order = []
         self.chains = {}           # repo -> [package] in chain order
         self.warnings = []
+        self.notices = []          # printed by check without failing it (a ticket with no 검증 목표)
         self._tc_rows = None
         if self.single_doc:
             self._read_single_doc()
@@ -234,6 +271,7 @@ class Design:
                 self.warnings.append(f"{pkg}: 티켓 트리 표에 행이 없다")
         self._read_chain_table(doc)
         blocks, list_heading = self._read_checklists(doc)
+        self._read_goal_table(doc)
         for pkg, t in self.tickets.items():
             parts = [blocks.get(pkg, "")]
             if pkg in tree_rows:
@@ -242,6 +280,18 @@ class Design:
             parts.append(f"정본: design.md — {src}")
             t.index_section = "\n\n".join(p for p in parts if p)
         tree_rows.pop("", None)
+
+    def _read_goal_table(self, doc):
+        """A 「티켓 · 검증 목표」 table (e.g. 「티켓별 검증 목표」): its cell is the goal of a ticket whose checklist has no
+        「검증 목표:」 list. The 티켓 cell may start with the Jira key, as in the tree table."""
+        for head, rows, _ in tables(doc):
+            ci, gi = col(head, "티켓"), col(head, "검증 목표")
+            if ci != 0 or gi is None:
+                continue
+            for r in rows:
+                pkg = next((p for p in packages_in(strip_md(r[ci])) if p in self.tickets), None) if r else None
+                if pkg in self.tickets and gi < len(r) and not is_dash(r[gi]) and not self.tickets[pkg].goals:
+                    self.tickets[pkg].goals = [strip_md(r[gi])]
 
     def _read_tree(self, doc):
         """Rows of the 티켓 트리 table -> {package: 'heading + header + raw row'}, '' -> the table heading."""
@@ -312,7 +362,7 @@ class Design:
     def _read_checklists(self, doc):
         """Boxes from the 체크리스트 section -> ({package: raw block}, heading)."""
         heading, body = section(doc, "체크리스트")
-        blocks, current, start, fence = {}, None, 0, False
+        blocks, current, start, fence, starts = {}, None, 0, False, []
         lines = body.splitlines()
         for i, line in enumerate(lines):
             if line.strip().startswith("```"):
@@ -330,9 +380,15 @@ class Design:
             h = re.match(r"^([A-Z][A-Z0-9]*\d+[A-Za-z]?)\s+—\s+", line)
             if h:
                 current, start = h.group(1), i
+                starts.append((current, i))
                 if current not in self.tickets:
                     self.warnings.append(f"{current}: 체크리스트에 있지만 구현 순서·트리 표에 없다")
                     self.ticket(current)
+        for k, (pkg, s) in enumerate(starts):  # 검증 목표 lists sit between a ticket's line and the next one's
+            region = lines[s + 1:starts[k + 1][1] if k + 1 < len(starts) else len(lines)]
+            goals = goals_in("\n".join(l for l in region if not l.strip().startswith("```") and not re.match(r"^\s*\[[ xX]\]", l)))
+            if goals:
+                self.tickets[pkg].goals = goals
         return blocks, heading
 
     # ---- plan/ticket-index.md
@@ -377,6 +433,7 @@ class Design:
             t.index_section = body.strip()
             tm = re.search(r"^- 테스트:\s*(.+)$", body, re.M)
             t.index_tests = tm.group(1).strip() if tm else ""
+            t.goals = goals_in(body)
 
     # ---- plan/jira-map.md
     def _read_jira_map(self):
@@ -432,6 +489,9 @@ class Design:
                 t.tcs = self.criteria_tcs(t.index_tests)
             if not t.boxes:
                 self.warnings.append(f"{t.package}: {'체크리스트' if self.single_doc else 'commits.md'} 에 체크박스가 없다")
+            elif not t.goals and not t.verification_only:
+                where = "체크리스트의 티켓 줄 아래" if self.single_doc else "ticket-index 티켓 절"
+                self.notices.append(f"{t.package}: 검증 목표가 없다 ({where} 「검증 목표:」) — 통합 리뷰는 기본 관점만 본다")
         # chains: order.md wins; otherwise follow 체인 앞 links from ticket-index
         if not self.chains:
             for t in self.tickets.values():

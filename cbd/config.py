@@ -28,6 +28,10 @@ DEFAULTS = {
     "jira": {},
     "mail_wait_ms": 120000,
     "quiet_limit_sec": 7200,
+    "integration_review": True,     # ticket integration review after the last checkbox (needs reviewers)
+    "ui_snapshots": ["snapshots/{pkg}", "design-snapshots/{pkg}"],  # design-root dirs of exported Figma frames
+    "integration_fix_title": "fix: 티켓 통합 리뷰 지적 반영",
+    "cumulative_check": {"enabled": True, "reviewer": "codex"},  # GPT check of base..commit after every commit
     "alerts": True,                 # append stops and worker questions to state/alerts.jsonl
     "auto_resolve": {"after_sec": 900, "max": 3},  # scheduler reopens a retryable stop after_sec later, max times
 }

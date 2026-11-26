@@ -8,6 +8,10 @@
   An agent `verify` whose implementer staged nothing (tests only) skips reviewers and judge; the driver commits the
   draft --allow-empty.
 
+Ticket integration review (체크박스를 넘는 검증 §3): after the design's last checkbox, the reviewers read the whole
+branch once against the ticket's 검증 목표 ("<PKG>#통합 리뷰 <이름>", box INTEGRATION). Findings add one fix checkbox
+(fix_source "integration") that runs as an agent box after the review.
+
 Session keys are the Orca task titles and the plan.json `key`: "<PKG>#<n> <역할> <이름>", which the dashboard
 matches by title when a plan row has no task id yet.
 """
@@ -15,6 +19,7 @@ matches by title when a plan row has no task id yet.
 import re
 
 DRIVER_VERIFY, DRIVER_PIN, AGENT = "driver-verify", "driver-pin", "agent"
+INTEGRATION = "통합"  # the box value of the integration review's sessions and record
 
 
 def kind(cfg, ticket, box):
@@ -49,16 +54,36 @@ def sessions(cfg, ticket, box):
     return rows
 
 
+def integration_enabled(cfg):
+    return bool(cfg.get("integration_review", True) and cfg["reviewers"])
+
+
+def integration_sessions(cfg, ticket):
+    return [{"key": f"{ticket.package}#{INTEGRATION} 리뷰 {r['name']}", "kind": f"review-{r['name']}",
+             "agent": r["agent"], "model": r["model"], "deps": []} for r in cfg["reviewers"]]
+
+
 def ticket_sessions(cfg, ticket, boxes=None):
-    """All sessions of a ticket, each checkbox's first session depending on the previous checkbox's last one."""
-    out, last = [], None
-    for box in boxes if boxes is not None else ticket.boxes:
+    """All sessions of a ticket, each checkbox's first session depending on the previous checkbox's last one(s).
+    The integration review comes after the design's checkboxes and before the fix checkbox it may add."""
+    out, last = [], []
+    boxes = list(boxes if boxes is not None else ticket.boxes)
+    at = next((i for i, b in enumerate(boxes) if getattr(b, "fix_source", "") == "integration"), len(boxes))
+    seq = boxes[:at] + ([INTEGRATION] if integration_enabled(cfg) else []) + boxes[at:]
+    for box in seq:
+        if box == INTEGRATION:
+            rows = integration_sessions(cfg, ticket)
+            for r in rows:
+                r.update(deps=list(last), box=INTEGRATION, title="티켓 통합 리뷰")
+            out += rows
+            last = [r["key"] for r in rows]
+            continue
         rows = sessions(cfg, ticket, box)
         if last and not rows[0]["deps"]:
-            rows[0]["deps"] = [last]
+            rows[0]["deps"] = list(last)
         for r in rows:
             r["box"] = box.index
             r["title"] = box.title
         out += rows
-        last = rows[-1]["key"]
+        last = [rows[-1]["key"]]
     return out

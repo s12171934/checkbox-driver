@@ -85,9 +85,11 @@ def cmd_check(a):
         kinds = [B.kind(cfg, t, b) for b in t.boxes]
         drv = sum(1 for k in kinds if k != B.AGENT)
         print(f"  {pkg:4} {t.jira or '-':10} {t.branch or '(브랜치 없음)':40} 선행 {','.join(t.predecessors) or '-':12} "
-              f"체크박스 {len(t.boxes)} (드라이버 {drv}) TC {len(t.tcs)}")
+              f"체크박스 {len(t.boxes)} (드라이버 {drv}) TC {len(t.tcs)} 검증 목표 {len(t.goals)}")
     for w in design.warnings:
         print(f"  ! {w}")
+    for n in design.notices:  # reported, not a failure: the ticket still runs
+        print(f"  ~ {n}")
     return 1 if design.warnings else 0
 
 

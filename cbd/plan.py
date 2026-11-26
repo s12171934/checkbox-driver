@@ -18,15 +18,29 @@ from cbd.util import git, now_iso, write_json, write_text
 def ticket_boxes(design, st, pkg):
     """The checkboxes as the ticket now has them: the driver's list once started (fix boxes may be added), else the design's."""
     if st.get("checkboxes"):
-        return [Box(c["index"], c["title"], c.get("phase") == "done") for c in st["checkboxes"]]
+        out = []
+        for c in st["checkboxes"]:
+            b = Box(c["index"], c["title"], c.get("phase") == "done")
+            b.fix_source = c.get("fix_source") or ""
+            out.append(b)
+        return out
     return design.tickets[pkg].boxes
 
 
+def record(st, box):
+    """The state record a session row belongs to: a checkbox, or the integration review."""
+    if box == B.INTEGRATION:
+        return st.get("integration")
+    return next((c for c in st.get("checkboxes") or [] if c["index"] == box), None)
+
+
 def session_status(st, row):
-    c = next((c for c in st.get("checkboxes") or [] if c["index"] == row["box"]), None)
+    c = record(st, row["box"])
     if not c:
         return "planned"
     if row["kind"] in (c.get("skipped") or {}):
+        return "skipped"
+    if c.get("phase") == "skipped":
         return "skipped"
     if c.get("phase") == "done":
         return "done"
@@ -54,7 +68,7 @@ def build(cfg, design, store, alive=frozenset()):
         bx = ticket_boxes(design, st, pkg)
         rows = []
         for r in B.ticket_sessions(cfg, t, bx):
-            c = next((c for c in st.get("checkboxes") or [] if c["index"] == r["box"]), {})
+            c = record(st, r["box"]) or {}
             row = {"key": r["key"], "box": r["box"], "kind": r["kind"], "agent": r["agent"], "model": r["model"],
                    "status": session_status(st, r), "deps": r["deps"], "title": r["title"]}
             tid = (c.get("tasks") or {}).get(r["kind"])
@@ -83,6 +97,8 @@ def build(cfg, design, store, alive=frozenset()):
                                      "rule": "선행 verified · 가장 가까운 verified 체인 헤드 위"},
                          "status": "created" if wt else "planned", "path": wt or ""},
             "tc_plan": [{"tc": tc, "box": None} for tc in t.tcs],
+            "goals": t.goals or (st.get("integration") or {}).get("goals") or [],
+            "integration": (st.get("integration") or {}).get("phase") or ("planned" if B.integration_enabled(cfg) else "off"),
             "selection": cands[pkg].reason if pkg in cands else "",
         })
     plan = {"project": cfg["project"], "driver": "checkbox-driver", "generated_at": now_iso(),

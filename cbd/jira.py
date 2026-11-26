@@ -3,6 +3,9 @@
 config.json "jira": {"site": "x.atlassian.net", "email": "...", "token_keychain_service": "..." (or env
 ATLASSIAN_API_TOKEN), "progress_status": "진행 중", "done_status": "완료"}
 
+Verification goals = the list under a heading (or a bold paragraph) 「검증 목표」 in the description — the driver reads
+them only when the design has none for the ticket (the design is the source the ticket body was written from).
+
 Checklist = the ticket description's ADF taskList (jira-map: 체크리스트는 commits 목록 그대로). An item matches a
 checkbox when its text, stripped of backticks and spaces, equals or contains the commit title.
 """
@@ -94,6 +97,13 @@ class Jira:
         self.call("PUT", f"rest/api/3/issue/{key}", {"fields": {"description": desc}})
         return True
 
+    def goals(self, key):
+        """Items of the description's 「검증 목표」 section ([] when there is none)."""
+        if not self.enabled or not key:
+            return []
+        desc = self.call("GET", f"rest/api/3/issue/{key}?fields=description")["fields"].get("description") or {}
+        return goals_of(desc)
+
     def add_box(self, key, title):
         """Append a checklist item (a fix box added after the start)."""
         if not self.enabled or not key:
@@ -109,6 +119,34 @@ class Jira:
             desc["content"].append({"type": "taskList", "attrs": {"localId": "cbd-list"}, "content": [item]})
         self.call("PUT", f"rest/api/3/issue/{key}", {"fields": {"description": desc}})
         return True
+
+
+def goals_of(desc):
+    """The 「검증 목표」 section of an ADF description: from a heading (or a paragraph that is only that label) up to
+    the next heading — list items one goal each, other paragraphs one goal each. A paragraph 「검증 목표: <text>」 is the
+    inline form: <text> is the one goal, and the paragraphs and checklist after it are not goals."""
+    out, on = [], False
+    for node in desc.get("content") or []:
+        text = "".join(_texts(node)).strip()
+        inline = re.match(r"^검증 목표\s*[:：]\s*(\S.*)$", text, re.S)
+        if node.get("type") == "paragraph" and inline and not on:
+            return [inline.group(1).strip()]
+        label = re.sub(r"[\s*:：]+$", "", text)
+        if node.get("type") == "heading" or (node.get("type") == "paragraph" and label == "검증 목표"):
+            if on:
+                break
+            on = label == "검증 목표"
+            continue
+        if not on:
+            continue
+        if node.get("type") in ("bulletList", "orderedList", "taskList"):
+            for item in node.get("content") or []:
+                t = "".join(_texts(item)).strip()
+                if t:
+                    out.append(t)
+        elif text:
+            out.append(text)
+    return out
 
 
 def _texts(node):

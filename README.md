@@ -1,7 +1,7 @@
 ---
 title: checkbox-driver
 created: 2026-11-10
-updated: 2026-11-19
+updated: 2026-11-26
 tags: [domain/인공지능, area/ai에이전트, type/설계, agent/claude-d8702234-c5f1-4d44-ab58-9d35f1de6a58]
 source: ai
 status: active
@@ -18,8 +18,8 @@ status: active
 | 층 | 실체 | 하는 일 |
 | --- | --- | --- |
 | 스케줄러 | `cbd <키> schedule` (또는 캔버스 「구현 ① 프로젝트」의 드라이버 경로 + 자동화 — 이때 상시 스케줄러는 띄우지 않는다) | 선별 → 티켓마다 Orca 터미널을 열어 티켓 드라이버 기동, 끝난 티켓 터미널 닫기, plan.json 갱신 |
-| 티켓 드라이버 | `cbd <키> run <티켓>` (티켓당 한 프로세스·한 터미널·한 Orca Run) | 워크트리 → 태스크 사전 등록 → 체크박스마다 구현·리뷰·판정 → verified |
-| 워커 | Orca 오케스트레이션 워커 | 구현(스테이지만) · 리뷰(findings 파일) · 판정(커밋) |
+| 티켓 드라이버 | `cbd <키> run <티켓>` (티켓당 한 프로세스·한 터미널·한 Orca Run) | 워크트리 → 태스크 사전 등록 → 체크박스마다 구현·리뷰·판정(+ 커밋마다 누적 검증) → 티켓 통합 리뷰(→ 수정 체크박스·재측정) → verified |
+| 워커 | Orca 오케스트레이션 워커 | 구현(스테이지만) · 리뷰(findings 파일) · 판정(커밋) · 통합 리뷰 · 누적 검증(결과 파일) |
 
 ## 입력과 상태
 
@@ -30,8 +30,13 @@ status: active
   is blocked by`, 스택 체인 `저장소 · 체인`)로 찾는다. 체크리스트는 「R1 — PSD-1 · \`브랜치\`」 아래 코드 블록의 `[ ] <커밋 제목>`
   줄이고 `[ ] 완료` 줄은 버린다. 브랜치가 「—」인 검증 티켓은 드라이버가 띄우지 않으며(`launch` 도 안 됨), 그 티켓을 선행으로 둔
   티켓은 사람이 검증을 마치고 `start_waived` 에 적을 때까지 기다린다.
+- 검증 목표: 티켓마다 통합 리뷰·누적 검증의 기준. ticket-index 티켓 절의 `- 검증 목표:`(인라인 한 줄 또는 아래 들여쓴 목록),
+  single-doc 은 체크리스트의 티켓 줄과 다음 티켓 줄 사이 `검증 목표:` 목록 또는 「티켓 · 검증 목표」 표. 설계에 없으면 Jira 본문의
+  「검증 목표」 절(제목·라벨 문단 아래 목록, 또는 `검증 목표: <본문>` 한 문단)을 읽는다. 티켓을 만들 때 설계의 목표를 본문에도
+  적는다. 목표가 없는 티켓은 `check` 가 `~` 로 알리지만(종료 코드는 그대로) 그대로 진행하고, 통합 리뷰는 기본 관점만 본다.
 - 설정·상태: `~/.checkbox-driver/<키>/` (`CBD_HOME` 으로 바꿈) — `config.json`, `state/<티켓>.json`, `state/plan.json`(에이전트
-  대시보드 `external_plans` 계약), `state/state.md`, `state/replies/<run>/`, `logs/`, `work/<티켓>/<NN>/`(브리프·초안·findings·판정문).
+  대시보드 `external_plans` 계약), `state/state.md`, `state/replies/<run>/`, `logs/`, `work/<티켓>/<NN>/`(브리프·초안·findings·판정문), `work/<티켓>/통합/`(통합 리뷰 findings·UI 캡처),
+  `work/<티켓>/cumulative/<NN>.md`(누적 검증 결과).
 - `config.json` 은 재기동 없이 반영된다: 스케줄러는 매 회차, 티켓 드라이버는 체크박스 경계마다 다시 읽는다(진행 중 체크박스의 세션은
   그대로, JSON 오류면 직전 설정을 유지하고 경고 로그).
 
@@ -56,6 +61,18 @@ status: active
   판정은 `worker-start --task <판정> --terminal <구현 터미널> --worktree path:<워크트리>` 로 구현 터미널에 넣는다(끝난
   dispatch 가 잡은 터미널은 `dispatch --to` 로는 거부된다). 터미널이 닫혔거나 재사용이 어떤 이유로든 거부되면 그 사유를 로그에
   남기고 새 세션(`impl` 모델)으로 판정한다. 체크박스가 커밋되면 구현 터미널을 닫는다.
+- 티켓 통합 리뷰(config `integration_review`, 기본 켬): 설계의 마지막 체크박스 뒤 리뷰어 전원이 새 세션·1 라운드로
+  `base_sha..HEAD` 전체를 검증 목표에 비추어 본다(태스크 `<티켓>#통합 리뷰 <이름>` 은 착수 때 사전 등록). findings 첫 줄은
+  `판정: 지적 없음|N`. 지적 0 이면 verified 로, 있으면 끝에 수정 체크박스(`integration_fix_title`, 기본
+  `fix: 티켓 통합 리뷰 지적 반영`, Jira 체크리스트에도 추가)를 더해 에이전트 박스로 돌리고, 커밋 뒤 완료 기준 테스트와
+  타입 검사를 다시 재기만 한다(빨강이면 `검증 실패` 멈춤). 통합 리뷰는 다시 돌지 않는다.
+- UI 티켓(`ui_tickets`)의 통합 리뷰 codex 리뷰어는 Storybook ↔ Figma 상세 대조를 한다: 설계 루트의 스냅숏 폴더
+  (`ui_snapshots`, 기본 `snapshots/<티켓>`·`design-snapshots/<티켓>`)가 먼저, 없으면 티켓 설계·목표에 적힌 Figma 링크를 Figma MCP 로
+  직접 조회한다. Storybook 명령은 `repos.<이름>.storybook_cmd`(없으면 저장소 표준). 결과는 findings 의 `UI 대조` 표.
+- 누적 검증(config `cumulative_check`, 기본 `{"enabled": true, "reviewer": "codex"}` — 리뷰어 이름 또는 `agent`·`model` 직접 지정):
+  코드를 바꾼 커밋마다 GPT 세션 하나가 `base_sha..<커밋>` 을 git 객체로만 읽어 검증 목표·커밋 사이 계약을 본다. 루프는 기다리지
+  않는다(사용량 게이트가 막히면 `gated` 로 두고 다음 경계에서 띄움). 결과 첫 줄은 `판정: 문제 없음|N`. 문제·결과 없음은
+  `alerts.jsonl` 의 `cumulative` 로 코디네이터에 알리고 티켓은 멈추지 않는다. verified 전에는 남은 누적 검증을 기다린다.
 - 첫 verify 는 체인 앞 티켓이 verified 일 때만(verify 게이트). `box_prereqs` 는 체크박스 단위 선행.
 - 사용량 게이트 90%: 막히면 기다리고 리뷰어를 빼거나 바꾸지 않는다. 판독 실패면 마지막 성공 판독, 판독 이력이 없으면 진행.
 - 재기동해도 이어서 한다 — 완료 신호는 메일이 아니라 태스크 상태로 확인한다.
@@ -87,7 +104,8 @@ status: active
    "question": "…/replies/<run>/<msg>.question.md", "answer": "…/replies/<run>/<msg>.md", "msg_id": "msg_…", "worker": "ctx_…"}
   ```
 
-  `kind`: `blocked` · `question` · `escalation` · `auto_resolved` · `restart_limit`. 질문은 `answer` 경로에 답을 쓰면 드라이버가 보낸다.
+  `kind`: `blocked` · `question` · `escalation` · `auto_resolved` · `restart_limit` · `integration`(통합 리뷰 지적 → 수정 체크박스) ·
+  `cumulative`(누적 검증 문제 — `problems`·`commit`·`path`, 또는 결과 없음·기동 실패). 질문은 `answer` 경로에 답을 쓰면 드라이버가 보낸다.
 
 ## 명령
 
@@ -105,7 +123,7 @@ cbd <키> approve <티켓> <번호> · resolve <티켓> · defer <티켓> <번�
 
 ## 재구성하지 못한 것 (다음 단계)
 
-원본 기록에 있었지만 이번 재생성에 넣지 않았다: 착수 시트 작성 워커, 소비자 착수 실서버 대조, 화면 한 장면 대조, 티켓 통합 리뷰,
+원본 기록에 있었지만 이번 재생성에 넣지 않았다: 착수 시트 작성 워커, 소비자 착수 실서버 대조, 화면 한 장면 대조,
 finish 때 체인 앞 verified 헤드로의 리베이스(`rebase_pending`), 체크박스 경계 리베이스, 모델별 토큰 집계, 브랜치 구현이력 노트,
 run-tc(진행 파일·E2E 잠금). 브리프 원문은 남아 있지 않아 방식 문서 규칙으로 새로 썼다.
 

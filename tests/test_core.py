@@ -76,13 +76,30 @@ class BoxTest(Env):
         # UI ticket verify is an agent box; a pin chore is a driver box
         self.assertEqual([B.kind(self.cfg, b1, b) for b in b1.boxes], [B.DRIVER_PIN, B.AGENT, B.AGENT])
 
+    def test_goals_from_the_ticket_index_section(self):
+        self.assertEqual(self.design.tickets["A1"].goals, ["모델이 저장·조회 왕복에서 값을 잃지 않는다",
+                                                           "잘못된 입력은 저장 전에 거절된다"])
+        self.assertEqual(self.design.tickets["A2"].goals, [])
+        self.assertTrue(any(n.startswith("A2: 검증 목표가 없다") for n in self.design.notices))
+        self.assertFalse(any("검증 목표" in w for w in self.design.warnings))  # a notice, not a check failure
+
+    def test_goals_in_forms(self):
+        from cbd.design import goals_in
+        self.assertEqual(goals_in("검증 목표: 한 줄 목표\n- 다른 필드"), ["한 줄 목표"])
+        self.assertEqual(goals_in("검증 목표:\n- 가\n- 나\n\n뒤 문단"), ["가", "나"])
+        self.assertEqual(goals_in("- 필수: x\n- 검증 목표:\n  1. 가\n- 테스트: y"), ["가"])
+        self.assertEqual(goals_in("- 테스트: y"), [])
+
     def test_sessions_and_deps(self):
         rows = B.ticket_sessions(self.cfg, self.design.tickets["A1"])
         keys = [r["key"] for r in rows]
         self.assertEqual(keys[:4], ["A1#1 구현 claude", "A1#1 리뷰 codex", "A1#1 리뷰 claude", "A1#1 판정 claude"])
         self.assertEqual(rows[3]["deps"], ["A1#1 리뷰 codex", "A1#1 리뷰 claude"])
         self.assertEqual(rows[4]["deps"], ["A1#1 판정 claude"])  # next checkbox waits for the previous judge
-        self.assertEqual(rows[-1]["key"], "A1#3 드라이버 verify")
+        self.assertEqual(rows[-3]["key"], "A1#3 드라이버 verify")
+        # the ticket integration review comes last, after the last checkbox
+        self.assertEqual([r["key"] for r in rows[-2:]], ["A1#통합 리뷰 codex", "A1#통합 리뷰 claude"])
+        self.assertEqual(rows[-1]["deps"], ["A1#3 드라이버 verify"])
 
 
 class SelectTest(Env):
