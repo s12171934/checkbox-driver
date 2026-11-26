@@ -18,6 +18,7 @@ driver continues where the last one stopped (a worker_done received before a res
 status, not from the mailbox).
 """
 
+import datetime
 import os
 import re
 import shlex
@@ -37,6 +38,31 @@ from cbd.util import DriverError, git, now_iso, now_ts, run, write_text
 RETRY_DELAYS = (60, 120, 240)  # transient Orca errors (orca.transient): the same step again, then blocked
 WORKER_RETRIES = 3              # a failed or lost worker is started again with --retry-of this many times
 WORKER_GONE = ("failed", "lost", "cancelled", "canceled", "abandoned", "stopped")
+
+
+def _ts(iso):
+    return datetime.datetime.fromisoformat(iso).timestamp()
+
+
+def question_wait(questions, since, now):
+    """Seconds of [since, now] during which a worker question waited for its answer (asked → answered, or still open).
+    Overlapping questions count once. A question is not a stall: its wait is taken out of the quiet timer."""
+    spans = []
+    for q in questions or []:
+        try:
+            a = max(_ts(q["at"]), since)
+            b = min(_ts(q["answered"]) if q.get("answered") else now, now)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if b > a:
+            spans.append((a, b))
+    total, end = 0.0, since
+    for a, b in sorted(spans):
+        a = max(a, end)
+        if b > a:
+            total += b - a
+            end = b
+    return total
 
 
 class BoxWait(Exception):
@@ -695,7 +721,7 @@ class TicketDriver:
                 self.launch(c, kind, retry_of=prev)
                 started = now_ts()
                 continue
-            if now_ts() - started > int(self.cfg["quiet_limit_sec"]) and not self._has_open_question():
+            if self.quiet_for(started) > int(self.cfg["quiet_limit_sec"]) and not self._has_open_question():
                 raise DriverError("정체", f"#{c['index']} {kind} 가 {int(self.cfg['quiet_limit_sec']) // 60}분 동안 끝나지 않았다")
             self.pump(rid)
             if kind != "cumulative":
@@ -710,6 +736,12 @@ class TicketDriver:
         if w.get("state") in WORKER_GONE or w.get("liveness") in ("exited", "lost"):
             return f"워커 {d} 가 worker_done 없이 끝났다 (state {w.get('state')}, liveness {w.get('liveness')})"
         return None
+
+    def quiet_for(self, started):
+        """Seconds since `started` that count toward the stall limit: the wait for a worker question's answer does
+        not count, so the timer runs again from the answer instead of firing right after it."""
+        now = now_ts()
+        return now - started - question_wait(self.st.get("questions"), started, now)
 
     def _has_open_question(self):
         return any(not q.get("answered") for q in self.st.get("questions") or [])
@@ -1139,7 +1171,7 @@ class TicketDriver:
                 live |= rec.get("phase") in ("running", "gated")
             if not wait or not live:
                 return
-            if now_ts() - started > int(self.cfg["quiet_limit_sec"]) and not self._has_open_question():
+            if self.quiet_for(started) > int(self.cfg["quiet_limit_sec"]) and not self._has_open_question():
                 for rec in recs.values():  # reported and given up on: they never hold verified
                     if rec.get("phase") in ("running", "gated"):
                         rec.update(phase="failed", finished_at=now_iso())

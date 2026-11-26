@@ -50,6 +50,23 @@ def goals_text(goals):
         "(이 티켓에는 검증 목표가 적혀 있지 않다 — 아래 기본 관점만 본다)"
 
 
+def reading(design, ticket, titles=()):
+    """The ticket's 읽을 문서 text. A single-doc design adds the parts of design.md its text cites (contract sections,
+    TC rows, inventory rows) as heading names, so a worker told not to open anything else can still read its contract.
+    Multi-doc designs get the ticket-index section unchanged."""
+    text = ticket.index_section or "(ticket-index 절 없음)"
+    allow = design.read_allowance(ticket, titles)
+    if not allow:
+        return text
+    items = "\n".join(f"- {a}" for a in allow)
+    return f"""{text}
+
+읽어도 되는 설계 절 — `{os.path.join(design.root, 'design.md')}` 에서 아래 머리글의 절·표 행까지 연다(위 체크리스트·검증
+목표가 가리키는 계약 · 테스트 케이스 · 인벤토리). 그 밖의 절은 열지 않는다.
+
+{items}"""
+
+
 def integration_path(work, name):
     return os.path.join(work, f"findings-{name}.md")
 
@@ -120,7 +137,7 @@ def integration_review(cfg, design, ticket, worktree, work, name, base, goals):
     rc = {"pkg": ticket.package, "jira": ticket.jira or "(Jira 없음)", "worktree": worktree, "branch": ticket.branch,
           "work": work, "test_hint": _test_hint(cfg, ticket)}
     out = integration_path(work, name)
-    section = ticket.index_section or "(ticket-index 절 없음)"
+    section = reading(design, ticket)
     agent = next((r["agent"] for r in cfg["reviewers"] if r["name"] == name), name)
     ui = ui_compare(cfg, design, ticket, worktree, work, base, goals) \
         if agent == "codex" and cfg.is_ui(ticket.package) else ""
@@ -181,7 +198,7 @@ def cumulative(cfg, design, ticket, worktree, work, n, title, base, commit, goal
 - 코드를 고치지 않고, 스테이지·작업 트리·브랜치를 건드리지 않고, 테스트를 돌리지 않는다.
 - 설계 루트 `{design.root}` 의 읽을 문서:
 
-{ticket.index_section or "(ticket-index 절 없음)"}
+{reading(design, ticket)}
 
 ## 검증 목표
 
@@ -281,7 +298,7 @@ verified 헤드를 격리 스택으로 띄워**, 이 티켓이 소비할 API 가
 - API: {spec.get('apis') or '(설계에 API 이름이 없다 — 이 티켓 절이 소비하는 API 전부)'}
 - 계약 정본: 설계 루트 `{design.root}` 에서 위 API 의 계약 절(요청 파라미터 · 응답 필드 · 타입 · 에러 코드). 이 티켓의 설계:
 
-{ticket.index_section or "(ticket-index 절 없음)"}
+{reading(design, ticket)}
 
 ## 할 일
 
@@ -335,7 +352,7 @@ def context(cfg, design, ticket, box, worktree, work):
     return {
         "pkg": ticket.package, "n": box.index, "title": box.title, "jira": ticket.jira or "(Jira 없음)",
         "worktree": worktree, "branch": ticket.branch, "work": work, "design": design.root,
-        "section": ticket.index_section or "(ticket-index 절 없음)", "others": others,
+        "section": reading(design, ticket, [box.title]), "others": others,
         "test_hint": _test_hint(cfg, ticket), "subject": f"[{ticket.jira}] {box.title}" if ticket.jira else box.title,
         "records": (cfg.get("vault") or {}).get("records_dir") or "",
     }

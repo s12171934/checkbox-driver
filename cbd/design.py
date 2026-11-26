@@ -19,6 +19,10 @@ Section numbers move between projects, so sections are found by heading words an
 - 「티켓 · 검증 목표」 table (e.g. 「티켓별 검증 목표」): one goal per ticket without a 「검증 목표:」 list.
 - 테스트 케이스 section: TC rows, as tests/*.md.
 
+A single-doc brief cannot point at per-ticket files, so read_allowance names what a ticket's agents may open besides its
+own checklist and tree row: the sections its text cites (「(§11.2 F3)」), the test-case table rows of its TC IDs and its
+rows of an 「인벤토리」 table — heading names only, the section text is not pasted into the brief.
+
 Column positions differ between projects, so every table is read by its header names.
 """
 
@@ -29,6 +33,8 @@ import re
 from cbd.util import DriverError
 
 DASH = {"", "—", "-", "–"}
+SECTION_REF = re.compile(r"§\s*(\d+(?:\.\d+)*)(?:\s+([A-Z][A-Z0-9]*\d+[A-Za-z]?)(?![\w-]))?")
+NUMBERED_HEADING = re.compile(r"^#+\s+((\d+(?:\.\d+)*)\.?\s+.*?)\s*$")
 LAYER_WORDS = ("unit", "integration", "storybook", "e2e", "request", "system", "component", "contract")
 
 
@@ -227,6 +233,7 @@ class Design:
         self.warnings = []
         self.notices = []          # printed by check without failing it (a ticket with no 검증 목표)
         self._tc_rows = None
+        self._headings = None
         if self.single_doc:
             self._read_single_doc()
         else:
@@ -562,7 +569,7 @@ class Design:
         if self._tc_rows is not None:
             return self._tc_rows
         rows = {}
-        for stem, text in self._tc_sources():
+        for stem, text, top in self._tc_sources():
             for head, body, heading in tables(text):
                 idc = col(head, "ID", "TC")
                 if idc is None:
@@ -574,18 +581,67 @@ class Design:
                 for r in body:
                     for tc in re.findall(self.tc_pattern, r[idc] if idc < len(r) else ""):
                         layer = (r[lc].strip().lower() if lc is not None and lc < len(r) else "") or hl
-                        rows.setdefault(tc, {"layer": layer, "file": stem, "row": "| " + " | ".join(r) + " |"})
+                        rows.setdefault(tc, {"layer": layer, "file": stem, "heading": heading or top,
+                                             "row": "| " + " | ".join(r) + " |"})
         self._tc_rows = rows
         return rows
 
     def _tc_sources(self):
-        """(stem, text) of every TC document: tests/*.md, or the 테스트 케이스 section of design.md."""
+        """(stem, text, heading) of every TC document: tests/*.md, or the 테스트 케이스 section of design.md."""
         if self.single_doc:
-            yield "design", section(self.text("design.md"), "테스트 케이스")[1]
+            yield ("design", *reversed(section(self.text("design.md"), "테스트 케이스")))
             return
         for path in sorted(glob.glob(self.p("tests", "*.md"))):
             with open(path, encoding="utf-8") as f:
-                yield os.path.splitext(os.path.basename(path))[0], f.read()
+                stem = os.path.splitext(os.path.basename(path))[0]
+                yield stem, f.read(), f"tests/{stem}.md"
+
+    # ---- what a single-doc brief may open besides the ticket's own text
+    def numbered_headings(self):
+        """{'11.2': '11.2 front-common (presentational only)'} — the numbered headings of design.md (fences skipped)."""
+        if self._headings is None:
+            self._headings, fence = {}, False
+            for line in self.text("design.md").splitlines():
+                if line.strip().startswith("```"):
+                    fence = not fence
+                    continue
+                m = None if fence else NUMBERED_HEADING.match(line)
+                if m:
+                    self._headings.setdefault(m.group(2), m.group(1))
+        return self._headings
+
+    def read_allowance(self, ticket, titles=()):
+        """Single-doc only: [line] naming the parts of design.md the ticket's agents may read besides its checklist and
+        tree row — (a) every 「§N」/「§N.M」 its text, checklist titles and `titles` cite, (b) the test-case table rows
+        of its TC IDs, (c) its rows of an 「인벤토리」 table. Heading names only (the brief stays small); [] otherwise."""
+        if not self.single_doc:
+            return []
+        out, heads = [], self.numbered_headings()
+        text = "\n".join([ticket.index_section or "", *(b.title for b in ticket.boxes), *titles])
+        refs = list(dict.fromkeys((m.group(1), m.group(2) or "") for m in SECTION_REF.finditer(text)))
+        for num, part in refs:
+            if part and (num, "") in refs:
+                continue
+            cite = f"§{num}" + (f" {part}" if part else "")
+            out.append(f"「{heads[num]}」" + (f" 중 {part} 부분" if part else "") + f" ({cite})" if num in heads else
+                       f"{cite} — design.md 에 이 번호의 머리글이 없다")
+        tcs = list(dict.fromkeys([*ticket.tcs, *expand_tcs(text, self.tc_pattern)]))
+        rows, by_heading = self.tc_rows(), {}
+        for tc in tcs:
+            if tc in rows:
+                by_heading.setdefault(rows[tc]["heading"], []).append(tc)
+        for heading, ids in by_heading.items():
+            out.append(f"「{heading}」 표의 {' · '.join(ids)} 행 (테스트 케이스)")
+        mark = re.compile(rf"(?<![A-Za-z0-9]){re.escape(ticket.package)}(?![\w-])")
+        for head, body, heading in tables(self.text("design.md")):
+            if "인벤토리" not in heading:
+                continue
+            ci = col(head, "패키지", "티켓")
+            ci = 0 if ci is None else ci
+            keys = [r[0] for r in body if ci < len(r) and mark.search(strip_md(r[ci]))]
+            if keys:
+                out.append(f"「{heading}」 표의 {ticket.package} 행 — " + " / ".join(keys))
+        return out
 
     def criteria_tcs(self, criteria):
         """TC IDs of a 완료 기준 cell, including 「tests/M 의 storybook 층 TC-M-* 전부」 style layer phrases."""
