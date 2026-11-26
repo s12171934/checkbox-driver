@@ -470,10 +470,18 @@ class TicketDriver:
         sp = os.path.join(wt, sub)
         if not os.path.exists(os.path.join(sp, ".git")):
             git(wt, "submodule", "update", "--init", sub, timeout=600)
-        git(sp, "fetch", "--quiet", "origin", timeout=600)
+        # Producer branches are not pushed while implementing: take the head from the producer's worktree first.
+        src = states.get(producer, {}).get("worktree")
+        branch = self.design.tickets[producer].branch if producer in self.design.tickets else None
+        if src and branch and os.path.isdir(src):
+            git(sp, "fetch", "--quiet", src, f"refs/heads/{branch}", timeout=600)
+        if run(["git", "-C", sp, "cat-file", "-e", f"{head}^{{commit}}"]).returncode != 0:
+            git(sp, "fetch", "--quiet", "origin", timeout=600)
         git(sp, "checkout", "--quiet", head)
         git(wt, "add", sub)
-        r = run(["git", "-C", wt, "commit", "-m", self.subject(c), "-m", f"{sub} → {producer} verified head {head}"])
+        empty = run(["git", "-C", wt, "diff", "--cached", "--quiet"]).returncode == 0  # pin already at head (chain prev)
+        r = run(["git", "-C", wt, "commit", *(["--allow-empty"] if empty else []), "-m", self.subject(c),
+                 "-m", f"{sub} → {producer} verified head {head}"])
         if r.returncode != 0:
             raise DriverError("환경", f"핀 커밋 실패 (훅?): {(r.stderr or r.stdout).strip()[-300:]}")
         c["commit"] = git(wt, "rev-parse", "HEAD")

@@ -272,6 +272,7 @@ class Design:
         self._read_chain_table(doc)
         blocks, list_heading = self._read_checklists(doc)
         self._read_goal_table(doc)
+        self._read_pins_from_boxes()
         for pkg, t in self.tickets.items():
             parts = [blocks.get(pkg, "")]
             if pkg in tree_rows:
@@ -280,6 +281,17 @@ class Design:
             parts.append(f"정본: design.md — {src}")
             t.index_section = "\n\n".join(p for p in parts if p)
         tree_rows.pop("", None)
+
+    def _read_pins_from_boxes(self):
+        """single-doc has no 핀 column: a `chore` box 「…핀 → F2 브랜치 헤드」 names the producer whose verified head it pins."""
+        for t in self.tickets.values():
+            for b in t.boxes:
+                m = re.search(r"(?:핀|\bpin\b)\s*(?:→|->)\s*(.+)$", b.title, re.I)
+                if b.prefix != "chore" or not m:
+                    continue
+                pins = [p for p in packages_in(m.group(1)) if p in self.tickets and p != t.package]
+                if pins and not t.pin:
+                    t.pin = pins[0]
 
     def _read_goal_table(self, doc):
         """A 「티켓 · 검증 목표」 table (e.g. 「티켓별 검증 목표」): its cell is the goal of a ticket whose checklist has no
