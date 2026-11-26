@@ -549,17 +549,7 @@ class TicketDriver:
         sub = rc.get("pin_path")
         if not sub:
             raise DriverError("환경", f"repos.{self.t.repo}.pin_path 가 없어 핀을 올릴 수 없다")
-        sp = os.path.join(wt, sub)
-        if not os.path.exists(os.path.join(sp, ".git")):
-            git(wt, "submodule", "update", "--init", sub, timeout=600)
-        # Producer branches are not pushed while implementing: take the head from the producer's worktree first.
-        src = states.get(producer, {}).get("worktree")
-        branch = self.design.tickets[producer].branch if producer in self.design.tickets else None
-        if src and branch and os.path.isdir(src):
-            git(sp, "fetch", "--quiet", src, f"refs/heads/{branch}", timeout=600)
-        if run(["git", "-C", sp, "cat-file", "-e", f"{head}^{{commit}}"]).returncode != 0:
-            git(sp, "fetch", "--quiet", "origin", timeout=600)
-        git(sp, "checkout", "--quiet", head)
+        sync_submodule(wt, sub, head, pin_sources(self.cfg, self.design, self.t, states, sub))
         git(wt, "add", sub)
         empty = run(["git", "-C", wt, "diff", "--cached", "--quiet"]).returncode == 0  # pin already at head (chain prev)
         r = run(["git", "-C", wt, "commit", *(["--allow-empty"] if empty else []), "-m", self.subject(c),
@@ -567,6 +557,20 @@ class TicketDriver:
         if r.returncode != 0:
             raise DriverError("환경", f"핀 커밋 실패 (훅?): {(r.stderr or r.stdout).strip()[-300:]}")
         c["commit"] = git(wt, "rev-parse", "HEAD")
+
+    def sync_pin_checkout(self, states):
+        """After a boundary rebase the pin gitlink may have moved (the new base pinned another producer head) while an
+        initialized pin submodule still has the old commit checked out: move it to the gitlink, from local sources
+        first, so the work tree is clean and the re-measure builds against the pinned code. An uninitialized one is
+        left alone."""
+        wt, sub = self.st["worktree"], self.cfg.repo(self.t.repo).get("pin_path")
+        if not sub or not os.path.exists(os.path.join(wt, sub, ".git")):
+            return
+        want = run(["git", "-C", wt, "rev-parse", f"HEAD:{sub}"]).stdout.strip()
+        have = run(["git", "-C", os.path.join(wt, sub), "rev-parse", "HEAD"]).stdout.strip()
+        if not want or want == have:
+            return
+        sync_submodule(wt, sub, want, pin_sources(self.cfg, self.design, self.t, states, sub))
 
     # ---- agent checkbox: implement -> review x N -> judge
     def agent_box(self, c):
@@ -881,6 +885,7 @@ class TicketDriver:
         st.setdefault("rebases", []).append(entry)
         st.update(base=new, base_sha=new["sha"])
         self.save()
+        self.sync_pin_checkout(states)
         after = self.measure(n, "rebase-after", only=green) if green else []
         entry["after"] = [t for _, _, t in after] or ["리베이스 전 초록이던 측정 없음 — 재측정 생략"]
         self.save()
@@ -1460,6 +1465,72 @@ class TicketDriver:
         self.log(f"verified {self.st['verified_head'][:10]} — 체크박스 {len(done)}개"
                  + (f" (수용으로 닫힘 {accepted}개 별도)" if accepted else ""))
         self.notify(f"{self.pkg} verified")
+
+
+def pin_sources(cfg, design, t, states, sub):
+    """Local places that may hold the pinned commit of ticket `t`'s pin submodule `sub`, nearest first, as (path, ref)
+    — a ref is fetched when the bare sha is refused. Producer branches are not pushed while implementing, so origin
+    often lacks the commit: the producer's worktree, the chain prev's worktree (its own `sub`, already pinned), and
+    the producer repo's main checkout (repos.<repo>.path, else Orca's repo list — looked up only when reached)."""
+    producer = t.pin and design.tickets.get(t.pin)
+    if t.pin:
+        yield (states.get(t.pin) or {}).get("worktree"), f"refs/heads/{producer.branch}" if producer and producer.branch else None
+    prev = getattr(t, "chain_prev", None)
+    if prev:
+        wt = (states.get(prev) or {}).get("worktree")
+        yield (os.path.join(wt, sub) if wt else None), None
+    name = getattr(producer, "repo", None) if producer else None
+    if name:
+        try:
+            rc = cfg.repo(name)
+        except (SystemExit, KeyError):
+            rc = {}
+        path = rc.get("path")
+        if not path:
+            try:
+                path = orca.repo_path(rc.get("orca_repo") or name)
+            except DriverError:
+                path = None
+        yield path, None
+
+
+def _has_commit(path, sha):
+    return run(["git", "-C", path, "cat-file", "-e", f"{sha}^{{commit}}"]).returncode == 0
+
+
+def sync_submodule(wt, sub, sha, sources=()):
+    """Check out `sha` in submodule `sub` of work tree `wt`, initializing it first when needed, and leave it clean.
+    `git submodule update --init` fetches the gitlink from origin and fails ("not our ref") on a commit that was
+    never pushed; the clone it made is kept and the commit is fetched from the local `sources` ((path, ref) pairs,
+    see pin_sources), then from origin. The one place a pin submodule is initialized or moved (pin box, boundary
+    rebase)."""
+    sp = os.path.join(wt, sub)
+    if not os.path.exists(os.path.join(sp, ".git")):
+        r = run(["git", "-C", wt, "submodule", "update", "--init", "--", sub], timeout=600)
+        if not os.path.exists(os.path.join(sp, ".git")):
+            raise DriverError("환경", f"서브모듈 {sub} init 실패: {(r.stderr or r.stdout).strip()[-300:]}")
+    tried = []
+    if not _has_commit(sp, sha):
+        for src, ref in sources:
+            if not src or not os.path.isdir(src):
+                continue
+            tried.append(src)
+            for spec in [sha] + ([ref] if ref else []):
+                if run(["git", "-C", sp, "fetch", "--quiet", src, spec], timeout=600).returncode == 0 and \
+                        _has_commit(sp, sha):
+                    break
+            if _has_commit(sp, sha):
+                break
+    if not _has_commit(sp, sha):
+        tried.append("origin")
+        run(["git", "-C", sp, "fetch", "--quiet", "origin"], timeout=600)
+    if not _has_commit(sp, sha):
+        raise DriverError("환경", f"서브모듈 {sub} 에 {sha[:10]} 가 없다 — {', '.join(tried)} 어디에서도 받지 못함")
+    git(sp, "checkout", "--quiet", sha)
+    dirty = git(sp, "status", "--porcelain")
+    if dirty:
+        raise DriverError("환경", f"서브모듈 {sub} 를 {sha[:10]} 로 옮긴 뒤 작업 트리가 깨끗하지 않다: {dirty[:300]}")
+    return sha
 
 
 COORDINATOR_FIX_TITLE = "fix: 코디네이터 수정 지시 반영"

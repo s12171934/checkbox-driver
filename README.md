@@ -85,8 +85,13 @@ status: active
   재기동 때 옛 드라이버 터미널을 닫는다. 드라이버의 예상 밖 예외는 `멈춤 [드라이버 오류]` 로 남긴다.
 - 체크박스: `verify`(UI 티켓 제외)와 핀 `chore` 는 드라이버가 직접 커밋한다.
   핀 대상은 ticket-index 「핀」 열, single-doc 은 체크박스 제목 `chore(…): 핀 → <패키지> …` 의 패키지다. 핀은 `repos.<저장소>.pin_path`
-  (서브모듈 경로, 예 `front-common`) 를 생산자 verified 헤드로 옮긴다 — 생산자 브랜치는 구현 중 push 하지 않으므로 생산자 워크트리의
-  브랜치에서 먼저 받고, 없으면 origin 에서 받는다. 이미 그 헤드면(체인 앞과 같은 핀) 빈 커밋을 남긴다.
+  (서브모듈 경로, 예 `front-common`) 를 생산자 verified 헤드로 옮긴다 — 생산자 브랜치는 구현 중 push 하지 않으므로 그 커밋을
+  로컬 출처에서 먼저 받는다: 생산자 워크트리(sha, 안 되면 그 브랜치) → 체인 앞 워크트리의 같은 서브모듈 → 생산자 저장소 주 체크아웃
+  (`repos.<생산자 저장소>.path`, 없으면 Orca 저장소 목록) → origin. 서브모듈이 아직 init 되지 않았으면(체인 앞 verified 헤드에서 막
+  만든 워크트리) `git submodule update --init` 이 origin 에서 그 gitlink 를 받다 `not our ref` 로 실패해도 클론은 남으므로, 같은
+  순서로 받아 checkout 하고 서브모듈 작업 트리가 깨끗한지 확인한다(PRD-94 D3, 2026-11-27). 어디에도 없으면 `환경` 으로 멈춘다.
+  이미 그 헤드면(체인 앞과 같은 핀) 빈 커밋을 남긴다. 경계 리베이스로 gitlink 가 바뀌면 init 된 핀 서브모듈만 같은 함수
+  (`sync_submodule`)로 새 gitlink 에 맞춘 뒤 재측정한다(init 안 된 것은 그대로 둔다).
   나머지는 구현 → 리뷰어 병렬(기본 Codex·Claude)
   → 같은 구현 터미널에서 판정·커밋. 커밋 제목 = `[Jira] <체크박스>`, 커밋 뒤 작업 트리가 깨끗해야 한다.
   에이전트가 도는 `verify`(UI 티켓·`agent_box_overrides`)가 스테이지 없이 `test-result.md`·초안만 남기면 리뷰·판정을
