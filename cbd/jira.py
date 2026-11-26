@@ -66,8 +66,9 @@ class Jira:
                 return True
         raise DriverError("환경", f"{key} 에 「{name}」 전이가 없다 (지금 {cur})")
 
-    def check_box(self, key, title, done=True):
-        """Tick the checklist item of `title`. Returns False when there is no matching item."""
+    def check_box(self, key, title, done=True, note=None):
+        """Tick the checklist item of `title`; `note` (a box closed without a commit, 「수용으로 닫힘: 사유」) is appended
+        to the item's text once so the list tells it apart from a committed box. Returns False when there is no item."""
         if not self.enabled or not key:
             return False
         desc = self.call("GET", f"rest/api/3/issue/{key}?fields=description")["fields"].get("description")
@@ -91,9 +92,13 @@ class Jira:
         if not hit:
             return False
         state = "DONE" if done else "TODO"
-        if hit[0].setdefault("attrs", {}).get("state") == state:
+        item = hit[0]
+        noted = not note or _norm(note) in _norm("".join(_texts(item)))
+        if item.setdefault("attrs", {}).get("state") == state and noted:
             return True
-        hit[0]["attrs"]["state"] = state
+        item["attrs"]["state"] = state
+        if not noted:
+            item.setdefault("content", []).append({"type": "text", "text": f" — {note}"})
         self.call("PUT", f"rest/api/3/issue/{key}", {"fields": {"description": desc}})
         return True
 

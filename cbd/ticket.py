@@ -34,6 +34,8 @@ from cbd.select import base_for, repo_base
 from cbd.state import BLOCKED, BOX_WAITING, DONE_STATUSES, REBASE_PENDING, RUNNING, VERIFIED, TicketLock
 from cbd.util import DriverError, git, now_iso, now_ts, run, write_text
 
+SETTLED = ("done", "deferred", "accepted")  # phases run_boxes never picks again; accepted = 수용으로 닫힘 (no commit)
+
 
 RETRY_DELAYS = (60, 120, 240)  # transient Orca errors (orca.transient): the same step again, then blocked
 WORKER_RETRIES = 3              # a failed or lost worker is started again with --retry-of this many times
@@ -182,6 +184,8 @@ class TicketDriver:
                 self.start_ticket()
                 self.ensure_run()
                 self.sync_kinds()
+                self.settle_accepted()
+                self.close_settled_tasks()
                 self.precreate_tasks()
                 self.contract_check()
                 self.run_boxes()
@@ -206,7 +210,8 @@ class TicketDriver:
 
     def run_boxes(self):
         while True:
-            c = next((c for c in self.st["checkboxes"] if c.get("phase") not in ("done", "deferred")), None)
+            self.settle_accepted()
+            c = next((c for c in self.st["checkboxes"] if c.get("phase") not in SETTLED), None)
             if not c:
                 return
             self.reload_config(c)
@@ -358,7 +363,7 @@ class TicketDriver:
         created = 0
         for r in rows:
             c = self.rec(r["box"])
-            if r["kind"] == "driver" or c.get("phase") in ("done", "deferred", "skipped", "fix") or \
+            if r["kind"] == "driver" or c.get("phase") in SETTLED + ("skipped", "fix") or \
                     (c.get("tasks") or {}).get(r["kind"]):
                 continue
             if r["box"] == B.INTEGRATION:
@@ -436,7 +441,7 @@ class TicketDriver:
         kinds = {(r["box"], r["kind"]) for r in B.ticket_sessions(self.cfg, self.t, list(boxes.values()))}
         changed = False
         for box in self.st["checkboxes"]:
-            if box.get("phase") in ("done", "deferred") or box.get("dispatch") or box["index"] not in boxes:
+            if box.get("phase") in SETTLED or box.get("dispatch") or box["index"] not in boxes:
                 continue
             kind = B.kind(self.cfg, self.t, boxes[box["index"]])
             if box.get("kind") != kind:
@@ -474,6 +479,9 @@ class TicketDriver:
             self.pin_box(c, states)
         else:
             self.agent_box(c)
+            if c.get("phase") == "accepted":  # a ui_scene fix box closed by the acceptance of its verify
+                P.write(self.cfg, self.design, self.store, orca.live_handles())
+                return
         c["phase"] = "done"
         c["finished_at"] = now_iso()
         self.progress += 1
@@ -569,6 +577,10 @@ class TicketDriver:
             self.ui_scene(c, work)
         if run(["git", "-C", wt, "diff", "--cached", "--quiet"]).returncode == 0:
             if not self.is_verify(c):
+                acc = self.fix_acceptance(c)
+                if acc:
+                    self.accept_box(c, acc, "구현이 스테이지 없이 끝났다")
+                    return
                 raise DriverError("정체", f"{c['index']}번 구현이 스테이지를 남기지 않았다")
             self.empty_verify(c, p)
             self.close_box_workers(c)
@@ -1010,6 +1022,65 @@ class TicketDriver:
             self.log(f"Jira 체크리스트에 #{m} 추가 실패 — {e.message}")
         raise Requeue()
 
+    # ---- 수용으로 닫힘: a ui_scene fix box made unnecessary by a person's acceptance of its verify (cbd accept-ui)
+    def fix_acceptance(self, c):
+        """The acceptance record of the verify a ui_scene fix box was inserted for, or None."""
+        if c.get("fix_source") != "ui_scene" or c.get("fix_for") is None:
+            return None
+        return self.store.ui_accepted(self.pkg, c["fix_for"])
+
+    def settle_accepted(self, tolerant=False):
+        """ui_scene fix boxes without a commit whose verify a person has accepted are closed as 「수용으로 닫힘」. A box
+        under way with changes on the work tree is left to finish (its changes are reviewed and committed)."""
+        for c in self.st.get("checkboxes") or []:
+            if c.get("phase") in ("done", "accepted") or c.get("commit"):
+                continue
+            acc = self.fix_acceptance(c)
+            if not acc:
+                continue
+            wt = self.st.get("worktree")
+            if c.get("dispatch") and wt and os.path.isdir(wt) and \
+                    git(wt, "status", "--porcelain", "--untracked-files=no").strip():
+                self.log(f"#{c['index']} 는 #{c['fix_for']} 수용 기록이 있지만 작업 트리에 변경이 있어 그대로 마친다")
+                continue
+            self.accept_box(c, acc, "수용 기록", tolerant=tolerant)
+
+    def accept_box(self, c, acc, why, tolerant=False):
+        """Close fix box c without a commit: phase accepted, the acceptance kept on the box, its unfinished Orca tasks
+        completed with the reason, its workers released, the Jira item ticked with a 「수용으로 닫힘」 note."""
+        n = c.get("fix_for")
+        reason = acc.get("reason", "")
+        c.update(phase="accepted", finished_at=now_iso(),
+                 accepted={"for": n, "at": acc.get("at"), "by": acc.get("by"), "reason": reason, "why": why})
+        self.progress += 1
+        self.save()
+        self.log(f"#{c['index']} 수용으로 닫힘 — #{n} 화면 대조 수용({why}): {reason[:80]}")
+        try:
+            self.close_box_tasks(c, f"수용으로 닫힘 — #{n} 화면 대조 수용: {reason}")
+        except DriverError as e:
+            if not tolerant:
+                raise
+            self.log(f"#{c['index']} 태스크를 지금 닫지 못함 — 드라이버가 기동 때 닫는다: {e.message[:200]}")
+        self.close_box_workers(c)
+        try:
+            self.jira.check_box(self.t.jira, c["title"], note=f"수용으로 닫힘: {reason}")
+        except DriverError as e:
+            self.log(f"#{c['index']} Jira 체크 실패 — {e.message}")
+
+    def close_box_tasks(self, c, why):
+        """Complete every unfinished Orca task of checkbox c (a later box's task depends on them: pending otherwise)."""
+        if close_open_tasks(self.st, c, why):
+            self.save()
+
+    def close_settled_tasks(self):
+        """On every start: deferred and accepted boxes whose tasks could not be closed by the command line (a
+        coordinator fenced from this Run) are closed by the driver, the Run's consumer."""
+        for c in self.st.get("checkboxes") or []:
+            if c.get("phase") in ("deferred", "accepted") and c.get("tasks") and not c.get("tasks_closed"):
+                why = "미룸 (cbd defer)" if c["phase"] == "deferred" else \
+                    f"수용으로 닫힘 — #{c.get('fix_for')} 화면 대조 수용: {(c.get('accepted') or {}).get('reason', '')}"
+                self.close_box_tasks(c, why)
+
     def reset_box(self, c, why):
         """Put an agent checkbox back to pending: unfinished sessions are closed, the scene result is kept aside under
         a numbered name (so the next run's result is not confused with it). Returns that archived path."""
@@ -1246,7 +1317,7 @@ class TicketDriver:
         self.st.pop("waiting_on", None)
         base = self.st.get("base_sha")
         n = int(git(wt, "rev-list", "--count", f"{base}..HEAD")) if base else len(done)
-        if n != len(done):
+        if n != len(done):  # accepted boxes (수용으로 닫힘) have no commit and are not counted
             self.log(f"커밋 수 {n} ≠ 체크박스 수 {len(done)} — 확인 필요 (브랜치 위 다른 티켓 커밋?)")
         self.st.update(status=VERIFIED, verified_head=git(wt, "rev-parse", "HEAD"), verified_at=now_iso())
         self.save()
@@ -1254,8 +1325,24 @@ class TicketDriver:
             self.jira.transition(self.t.jira, (self.cfg["jira"] or {}).get("done_status"))
         except DriverError as e:
             self.log(f"Jira 완료 전이 실패 — {e.message}")
-        self.log(f"verified {self.st['verified_head'][:10]} — 체크박스 {len(done)}개")
+        accepted = sum(1 for c in self.st["checkboxes"] if c.get("phase") == "accepted")
+        self.log(f"verified {self.st['verified_head'][:10]} — 체크박스 {len(done)}개"
+                 + (f" (수용으로 닫힘 {accepted}개 별도)" if accepted else ""))
         self.notify(f"{self.pkg} verified")
+
+
+def close_open_tasks(st, c, why):
+    """Complete the unfinished Orca tasks of record c with `why`; marks c tasks_closed. Returns True when c changed.
+    Raises the Orca error (task-update is fenced for a terminal bound to another Run)."""
+    rid, tids = st.get("run_id"), [t for t in (c.get("tasks") or {}).values() if t]
+    if not rid or not tids:
+        return False
+    known = orca.task_list(rid)
+    for tid in tids:
+        if tid in known and known[tid].get("status") != "completed":
+            orca.task_update(rid, tid, "completed", f"cbd: {why}")
+    c["tasks_closed"] = now_iso()
+    return True
 
 
 def verdict_of(path):

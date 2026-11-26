@@ -111,6 +111,14 @@ status: active
     쌓여도 불일치면 `사람 판정` 으로 멈춘다. 판단 불가도 `사람 판정`.
   - 고치지 않을 불일치는 사람만 받아들인다: `cbd <키> accept-ui <티켓> <번호> <사유>` 뒤 resolve — verify 가 다시 돌고 수용
     사유·시각이 verify 커밋 본문에 들어간다. 불일치·판단 불가인데 스테이지가 있으면 `검증 실패`.
+  - 수용은 그 verify 를 위해 넣은 수정 체크박스 중 커밋되지 않은 것을 **수용으로 닫힘**(phase `accepted`)으로 처리한다: 커밋 없음,
+    체크박스에 `accepted`(대상 verify·시각·누가·사유) 기록, 미완료 Orca 태스크는 사유와 함께 completed, Jira 체크리스트 항목은
+    체크하고 끝에 ` — 수용으로 닫힘: <사유>` 를 한 번 붙인다. plan.json 은 세션 `status: accepted`·`accepted`, 티켓
+    `boxes_accepted` 로 구분한다(`boxes_done` 에는 안 든다). 이 칸은 다시 집지 않고, `box_deferred` 로 세우지 않으며, 끝의
+    커밋 수 비교에서 빠진다. 드라이버가 멈춰 있으면 `accept-ui` 가 바로 닫고, 돌고 있으면 드라이버가 다음 체크박스 경계에서 닫는다
+    (그 칸에 dispatch 가 있고 작업 트리에 변경이 있으면 닫지 않고 평소대로 리뷰·커밋한다). 코디네이터 터미널이 다른 Run 에 묶여
+    task-update 가 막히면(consumer_fenced) 태스크는 드라이버가 기동 때 닫는다.
+  - 수정 체크박스 구현이 스테이지 없이 끝났는데 그 verify 의 수용 기록이 이미 있으면 `정체` 로 멈추지 않고 위와 같이 수용으로 닫는다.
 - 소비자 착수 실서버 대조(「실서버 대조:」 줄이 있는 티켓): 착수 직후·첫 체크박스 전에 세션 하나(`impl` 모델, 태스크
   `<티켓>#계약 대조 <이름>`)가 생산자 verified 헤드의 워크트리에서 격리 스택(빈 포트·대조 전용 DB, 기동 명령
   `repos.<생산자 저장소>.stack_cmd` 또는 저장소 표준)을 띄워 API 를 실제 요청으로 계약과 대조한다. 결과 첫 줄
@@ -170,6 +178,10 @@ cbd <키> status · plan                                # 현황 · plan.json/st
 cbd <키> approve <티켓> <번호> · resolve <티켓> · defer <티켓> <번호>
 cbd <키> accept-ui <티켓> <번호> <사유>               # UI verify 화면 불일치를 사람이 받아들임 (뒤에 resolve)
 ```
+
+- `defer` 는 그 칸을 `deferred` 로 두고 미완료 Orca 태스크를 completed(`미룸`)로 닫는다 — 열어 두면 뒤 칸 태스크가 그 태스크를 dep 으로
+  가져 pending(`task_not_startable`)으로 멈춘다. 닫기가 막히면(consumer_fenced) 드라이버가 기동 때 닫는다. 미룬 칸이 남으면 티켓은
+  끝에 `box_deferred` 로 선다.
 
 - 처음 띄울 때 `--coordinator-session` 에 감독하는 코디네이터 세션 id 를 준다. 값은 `scheduler.json` 에 남아 재기동 때 생략해도 된다. 없으면 대시보드가 plan.json 을 코디네이터에 붙이지 못해 워커 계획·묶음이 안 보인다.
   그래서 인자도 저장된 값도 없으면 상시 스케줄러는 기동을 거부한다(`실패 [환경] --coordinator-session 필요 …`, 종료 코드 2).

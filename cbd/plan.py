@@ -4,8 +4,10 @@ plan.json fields follow agent-dashboard server/adash/features/plans/external.py 
 top: project, driver, generated_at, design_root, design_commit, coordinator_session, coordinator_terminal,
      scheduler_terminal, tickets[], extra_worktrees[]
 ticket: package, jira, repo, predecessors, chain_position, chain_length, hold, max_parallel, status,
-        driver_terminal, driver_terminal_handle, run_id, boxes_total, boxes_done, sessions[], worktree{}, tc_plan[]
-session: key, box, kind, agent, model, status (planned·created·spawned·done·skipped), task_id, deps, title
+        driver_terminal, driver_terminal_handle, run_id, boxes_total, boxes_done, boxes_accepted, sessions[], worktree{},
+        tc_plan[]
+session: key, box, kind, agent, model, status (planned·created·spawned·done·skipped·deferred·accepted), task_id, deps,
+         title, accepted (수용으로 닫힘: {for, at, by, reason} — a ui_scene fix box closed without a commit)
 """
 
 from cbd import boxes as B
@@ -44,8 +46,8 @@ def session_status(st, row):
         return "skipped"
     if c.get("phase") == "done":
         return "done"
-    if c.get("phase") == "deferred":
-        return "deferred"
+    if c.get("phase") in ("deferred", "accepted"):
+        return c["phase"]
     task = (c.get("tasks") or {}).get(row["kind"])
     if (c.get("done") or {}).get(row["kind"]):
         return "done"
@@ -76,6 +78,8 @@ def build(cfg, design, store, alive=frozenset()):
                 row["task_id"] = tid
             if c.get("fix_source"):
                 row["fix_source"] = c["fix_source"]
+            if c.get("accepted"):
+                row["accepted"] = c["accepted"]
             rows.append(row)
         status = st.get("status", "planned")
         if status == "planned" and cands.get(pkg) and cands[pkg].selected:
@@ -90,6 +94,7 @@ def build(cfg, design, store, alive=frozenset()):
             "driver_terminal_handle": st.get("driver_terminal_handle") or "",
             "run_id": st.get("run_id") or "",
             "boxes_total": len(bx), "boxes_done": sum(1 for c in st.get("checkboxes") or [] if c.get("phase") == "done"),
+            "boxes_accepted": sum(1 for c in st.get("checkboxes") or [] if c.get("phase") == "accepted"),
             "sessions": rows,
             "worktree": {"repo": t.repo, "base_ref": (st.get("base") or {}).get("ref") or t.base or "",
                          "branch": st.get("branch") or t.branch,

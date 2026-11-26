@@ -9,7 +9,8 @@
   launch    <PKG>                                  launch one ticket now (held / blocked / waiting predecessors too)
   run       <PKG>                                  the ticket driver itself (runs inside the launched terminal)
   approve   <PKG> <n>                              human approval for checkbox n
-  accept-ui <PKG> <n> <사유>                        a person accepts the UI verify scene mismatch of checkbox n
+  accept-ui <PKG> <n> <사유>                        a person accepts the UI verify scene mismatch of checkbox n; the
+                                                   uncommitted fix boxes inserted for it close as 수용으로 닫힘
   resolve   <PKG>                                  close a ticket's open exceptions so the scheduler may relaunch it
   defer     <PKG> <n>                              skip checkbox n for now (the ticket stops on box_deferred at the end)
 """
@@ -123,7 +124,7 @@ def cmd_status(a):
         st = store.ticket(pkg)
         bx = st.get("checkboxes") or []
         done = sum(1 for c in bx if c.get("phase") == "done")
-        cur = next((c for c in bx if c.get("phase") not in ("done", "deferred")), None)
+        cur = next((c for c in bx if c.get("phase") not in ("done", "deferred", "accepted")), None)
         live = "●" if driver_alive(st, alive) else ("○" if st.get("driver_terminal_handle") in alive else " ")
         line = f"{live} {pkg:4} {st.get('status', PLANNED):14} {done}/{len(bx) or len(design.tickets[pkg].boxes)}"
         if cur:
@@ -290,6 +291,23 @@ def cmd_accept_ui(a):
         raise SystemExit("수용 사유가 필요하다")
     store.ui_accept(a.package, a.n, reason, by=os.environ.get("ORCA_TERMINAL_HANDLE") or "user")
     store.event(a.package, f"#{a.n} 화면 대조 불일치 사람 수용 — {reason[:80]}")
+    from cbd.state import TicketLock
+    from cbd.ticket import TicketDriver
+    lock = TicketLock(store, a.package)
+    if not lock.acquire():  # the running driver closes the fix boxes at its next checkbox boundary
+        print(f"{a.package} 드라이버가 돌고 있다 — #{a.n} 의 수정 체크박스는 드라이버가 다음 체크박스 경계에서 수용으로 닫는다")
+    else:
+        try:
+            d = TicketDriver(cfg, design, store, a.package)
+            before = {c["index"] for c in d.st.get("checkboxes") or [] if c.get("phase") == "accepted"}
+            d.settle_accepted(tolerant=True)
+            closed = [c["index"] for c in d.st.get("checkboxes") or []
+                      if c.get("phase") == "accepted" and c["index"] not in before]
+            if closed:
+                print(f"수정 체크박스 {', '.join(f'#{i}' for i in closed)} 수용으로 닫힘 (커밋 없음)")
+        finally:
+            lock.release()
+        P.write(cfg, design, store, orca.live_handles())
     print(f"{a.package}#{a.n} 화면 대조 수용 기록 — 멈춰 있었다면 cbd {a.key} resolve {a.package}")
 
 
@@ -304,11 +322,17 @@ def cmd_resolve(a):
 def cmd_defer(a):
     cfg, design, store = load(a.key)
     st = store.ticket(a.package)
+    from cbd.ticket import close_open_tasks
     for c in st.get("checkboxes") or []:
         if c["index"] == a.n:
             c["phase"] = "deferred"
             store.save(st)
             store.event(a.package, f"#{a.n} 미룸")
+            try:  # a later box's task depends on this box's tasks: left open, it stays pending (task_not_startable)
+                if close_open_tasks(st, c, "미룸 (cbd defer)"):
+                    store.save(st)
+            except DriverError as e:
+                print(f"{a.package}#{a.n} 태스크를 지금 닫지 못함 — 드라이버가 기동 때 닫는다: {e.message[:200]}")
             return
     raise SystemExit(f"{a.package}#{a.n} 가 없다 (착수 전 티켓은 미룰 수 없다)")
 

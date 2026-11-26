@@ -300,6 +300,109 @@ class UiSceneTest(Base):
         self.assertNotIn("A1#3 구현 claude", fake.started[started:])
         self.assertEqual(st["status"], "verified")
 
+    def cli(self, fake, *argv, fenced=False):
+        """cbd ex <argv> with the fake Orca; fenced = task-update refused (a coordinator bound to another Run)."""
+        from unittest import mock
+        from cbd import cli, orca
+
+        def refuse(*a, **k):
+            raise orca.OrcaError("consumer_fenced", "run is consumed by another terminal")
+        names = ["task_list", "worker_list", "live_handles", "worker_release", "terminal_close"]
+        with mock.patch.dict(os.environ, {"CBD_HOME": self.home}), \
+                mock.patch.multiple(orca, task_update=refuse if fenced else fake.task_update,
+                                    **{n: getattr(fake, n) for n in names}), \
+                mock.patch("cbd.plan.git", return_value="deadbeef"):
+            return cli.main(["ex", *argv])
+
+    def stalled_on_fix(self, scenes=("불일치", "불일치")):
+        """PRD-94 F3: #3 verify 불일치 -> fix box #4 before it -> #4's implementer stages nothing (시안끼리 모순) -> 정체."""
+        fake = Fake(self.repo, {"no_stage": (3, 4), "scene": {3: list(scenes)}})
+        self.assertEqual(self.drive(fake), 2)
+        st = self.store.ticket("A1")
+        self.assertIn("4번 구현이 스테이지를 남기지 않았다", st["exceptions"][-1]["message"])
+        self.assertEqual([c["index"] for c in st["checkboxes"]], [1, 2, 4, 3])
+        return fake
+
+    def open_tasks(self, fake, n):
+        c = next(c for c in self.store.ticket("A1")["checkboxes"] if c["index"] == n)
+        return {k: fake.tasks[t]["status"] for k, t in (c.get("tasks") or {}).items()
+                if fake.tasks[t]["status"] != "completed"}
+
+    def test_accept_ui_closes_the_uncommitted_fix_box_and_the_ticket_verifies(self):
+        fake = self.stalled_on_fix()
+        self.assertTrue(self.open_tasks(fake, 4))
+        self.assertEqual(self.cli(fake, "accept-ui", "A1", "3", "시안끼리", "모순", fenced=True), 0)
+        st = self.store.ticket("A1")
+        fix = next(c for c in st["checkboxes"] if c["index"] == 4)
+        self.assertEqual(fix["phase"], "accepted")
+        self.assertEqual(fix["accepted"]["reason"], "시안끼리 모순")
+        self.assertNotIn("commit", fix)
+        self.assertTrue(self.open_tasks(fake, 4))  # fenced: the driver closes them when it starts
+        self.store.resolve(st)
+        self.assertEqual(self.drive(fake), 0, self.store.ticket("A1").get("exceptions"))
+        st = self.store.ticket("A1")
+        self.assertEqual(st["status"], "verified")
+        self.assertEqual(self.open_tasks(fake, 4), {})
+        self.assertEqual(self.subjects(), ["[EX-1] verify: A1 테스트 그린", "[EX-1] feat(core): 모델 추가",
+                                           "[EX-1] test(core): TC-A-01~TC-A-03 빨강"])
+        self.assertFalse([e for e in self.store.events() if "커밋 수" in e["text"]])
+        plan = json.loads(_read(self.store.p("plan.json")))
+        a1 = next(t for t in plan["tickets"] if t["package"] == "A1")
+        self.assertEqual((a1["boxes_done"], a1["boxes_accepted"]), (3, 1))
+        self.assertEqual({s["status"] for s in a1["sessions"] if s["box"] == 4}, {"accepted"})
+
+    def test_fix_box_without_stage_after_acceptance_closes_as_accepted(self):
+        fake = Fake(self.repo, {"no_stage": (3, 4), "scene": {3: ["불일치", "불일치"]}})
+        start = fake.worker_start
+
+        def accept_during_fix(rid, tid, *a, **k):
+            if fake.titles[tid][0].startswith("A1#4 구현"):
+                self.store.ui_accept("A1", 3, "시안끼리 모순")
+            return start(rid, tid, *a, **k)
+        fake.worker_start = accept_during_fix
+        self.assertEqual(self.drive(fake), 0, self.store.ticket("A1").get("exceptions"))
+        st = self.store.ticket("A1")
+        self.assertEqual(st["status"], "verified")
+        fix = next(c for c in st["checkboxes"] if c["index"] == 4)
+        self.assertEqual(fix["phase"], "accepted")
+        self.assertEqual(self.open_tasks(fake, 4), {})
+        self.assertNotIn("[EX-1] fix: 화면 대조 불일치 반영", self.subjects())
+
+    def test_defer_closes_the_box_tasks_so_later_deps_are_not_stuck(self):
+        fake = self.stalled_on_fix()
+        self.assertEqual(self.cli(fake, "defer", "A1", "4"), 0)
+        self.assertEqual(self.open_tasks(fake, 4), {})
+
+    def test_fenced_defer_is_closed_by_the_driver_on_start(self):
+        fake = self.stalled_on_fix(("불일치", "일치"))
+        self.assertEqual(self.cli(fake, "defer", "A1", "4", fenced=True), 0)
+        self.assertTrue(self.open_tasks(fake, 4))
+        self.store.resolve(self.store.ticket("A1"))
+        self.assertEqual(self.drive(fake), 0, self.store.ticket("A1").get("exceptions"))
+        self.assertEqual(self.open_tasks(fake, 4), {})
+        self.assertEqual(self.store.ticket("A1")["status"], "box_deferred")
+
+    def test_jira_item_of_an_accepted_box_is_ticked_with_a_note_once(self):
+        from unittest import mock
+        from cbd.jira import Jira
+        desc = {"type": "doc", "content": [{"type": "taskList", "content": [
+            {"type": "taskItem", "attrs": {"state": "TODO"}, "content": [{"type": "text", "text": "fix: 화면 대조 불일치 반영"}]}]}]}
+        puts = []
+
+        def call(method, path, body=None):
+            if method == "PUT":
+                puts.append(body)
+                return {}
+            return {"fields": {"description": desc}}
+        j = Jira({"jira": {"site": "x", "email": "e"}})
+        with mock.patch.object(j, "call", side_effect=call):
+            self.assertTrue(j.check_box("EX-1", "fix: 화면 대조 불일치 반영", note="수용으로 닫힘: 시안끼리 모순"))
+            self.assertTrue(j.check_box("EX-1", "fix: 화면 대조 불일치 반영", note="수용으로 닫힘: 시안끼리 모순"))
+        item = desc["content"][0]["content"][0]
+        self.assertEqual(item["attrs"]["state"], "DONE")
+        self.assertEqual("".join(t["text"] for t in item["content"]), "fix: 화면 대조 불일치 반영 — 수용으로 닫힘: 시안끼리 모순")
+        self.assertEqual(len(puts), 1)
+
     def test_non_ui_ticket_verify_has_no_scene(self):
         self.conf(ui_tickets=[], agent_box_overrides=["A1#3"])
         fake = Fake(self.repo, {"no_stage": (3,)})
