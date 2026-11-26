@@ -44,6 +44,8 @@ status: active
 
 - 착수는 DAG 선행(ticket-index 「선행」)이 모두 verified 일 때. 베이스는 체인에서 가장 가까운 verified 티켓의 verified 헤드,
   없으면 저장소 베이스. verified 가 체인의 접두사가 아니면 그 체인을 멈춘다.
+  `chain_serial: true` 면 체인 앞 티켓도 착수 선행으로 기다린다 — 드라이버에 경계 리베이스가 없어, 끄면 선행만 같은 체인 티켓들이 각자
+  저장소 베이스에서 시작해 스택이 어긋난다(기본 false).
 - 저장소 베이스는 착수 때 그 저장소에서 `git fetch origin <ref>` 한 `origin/<ref>` sha 로 워크트리를 만든다(로컬 같은 이름
   브랜치는 쓰지 않는다). 같은 브랜치 워크트리를 재사용할 때 HEAD 가 베이스를 포함하지 않으면 멈춘다. 저장소 경로는
   `repos.<이름>.path`, 없으면 Orca 저장소 목록.

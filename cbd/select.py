@@ -2,6 +2,8 @@
 
 Rules (티켓 체크박스 커밋 리뷰 방식 · 같은 저장소 체인):
 - A ticket starts when every DAG predecessor (ticket-index 「선행」) is verified — chain order alone never blocks it.
+  With `chain_serial` it also waits for its chain prev, so it always starts on that ticket's verified head (the driver
+  has no boundary rebase; without it, chain tickets started together each start on the repo base).
   `start_waived` lists predecessors a ticket does not wait for.
 - Its base is the verified head of the nearest verified ticket before it in its repo chain, else the repo base.
   It never starts on top of an in-progress branch.
@@ -122,7 +124,10 @@ def select(design, states, cfg, alive=frozenset(), forced=()):
             out.append(Candidate(pkg, False, f"보류: {cfg['hold'][pkg]}", label))
             continue
         waived = set(cfg["start_waived"].get(pkg, []))
-        waiting = [d for d in t.predecessors if d not in waived and states.get(d, {}).get("status") not in DONE_STATUSES]
+        preds = list(t.predecessors)
+        if cfg["chain_serial"] and t.chain_prev and t.chain_prev not in preds:  # start on the chain prev's verified head
+            preds.append(t.chain_prev)
+        waiting = [d for d in preds if d not in waived and states.get(d, {}).get("status") not in DONE_STATUSES]
         if waiting and pkg not in forced and status != BOX_WAITING:
             out.append(Candidate(pkg, False, "선행 대기: " + ", ".join(waiting_label(design, d) for d in waiting), label))
             continue

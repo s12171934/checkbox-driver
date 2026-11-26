@@ -11,6 +11,7 @@ DEFAULTS = {
     "max_restarts": 3,
     "hold": {},                     # package -> reason: never launched by the scheduler, only by `launch`
     "start_waived": {},             # package -> [predecessors the start does not wait for]
+    "chain_serial": False,          # a ticket also waits for its chain prev (no boundary rebase: keeps the stack stacked)
     "box_prereqs": {},              # "PKG#n" -> [packages that must be verified before that checkbox]
     "approval_boxes": [],           # "PKG#n" checkboxes that need `cbd approve` before they run
     "agent_box_overrides": [],      # "PKG#n" checkboxes run by an agent although their prefix is a driver prefix
