@@ -219,8 +219,18 @@ def schedule_pass(cfg, design, store, forced=(), report=None):
     return launched
 
 
+def require_coordinator_session(a, store):
+    """The standing scheduler needs the coordinator session that owns the plan: plan.json carries it, and the
+    dashboard hangs the driver plan under that session. `--once` (canvas automation) is exempt."""
+    if a.once or a.coordinator_session or store.scheduler().get("coordinator_session"):
+        return
+    raise DriverError("환경", "--coordinator-session 필요 — 없으면 대시보드가 계획을 코디네이터에 붙이지 못한다"
+                              " (한 번 주면 state/scheduler.json 에 남아 재기동 때 생략해도 된다)")
+
+
 def cmd_schedule(a):
     cfg, design, store = load(a.key)
+    require_coordinator_session(a, store)
     store.save_scheduler({"scheduler_terminal": os.environ.get("ORCA_TERMINAL_HANDLE", ""),
                           **({"coordinator_session": a.coordinator_session} if a.coordinator_session else {})})
     while True:

@@ -289,7 +289,7 @@ class ConfigReloadTest(Env):
             else:
                 raise StopIteration
 
-        args = mock.Mock(key="ex", json=False, once=False, interval=1, coordinator_session=None)
+        args = mock.Mock(key="ex", json=False, once=False, interval=1, coordinator_session="coord-1")
         with mock.patch.dict(os.environ, {"CBD_HOME": self.home}), \
                 mock.patch("cbd.cli.schedule_pass", side_effect=record), \
                 mock.patch("cbd.cli.time.sleep", side_effect=sleep), \
