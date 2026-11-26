@@ -1,6 +1,6 @@
 """The ticket driver: `cbd <project> run <PKG>`, one process per ticket in its own Orca terminal.
 
-start_ticket -> ensure_run -> precreate_tasks -> contract_check -> process_checkbox x N -> integration_review
+start_ticket -> ensure_run -> sync_kinds -> precreate_tasks -> contract_check -> process_checkbox x N -> integration_review
   [-> fix checkbox -> remeasure] -> finish_ticket (verified, or rebase_pending while the chain prev is not verified)
 
 At every checkbox boundary (and before finishing) boundary_rebase moves the branch onto a nearer verified chain head
@@ -181,6 +181,7 @@ class TicketDriver:
             try:
                 self.start_ticket()
                 self.ensure_run()
+                self.sync_kinds()
                 self.precreate_tasks()
                 self.contract_check()
                 self.run_boxes()
@@ -424,22 +425,35 @@ class TicketDriver:
         if self.cfg.raw == before:
             return
         self.log(f"#{c['index']} 부터 바뀐 config.json 적용")
+        self.sync_kinds()
+        self.precreate_tasks()
+
+    def sync_kinds(self):
+        """Checkboxes not finished and not dispatched follow the current config: their kind is computed again (a ticket
+        taken out of ui_tickets turns an agent verify into a driver verify) and the sessions config no longer has are
+        closed. Run on every start (state may predate a config edit) and on a config edit at a checkbox boundary."""
         boxes = {b.index: b for b in self._boxes()}
         kinds = {(r["box"], r["kind"]) for r in B.ticket_sessions(self.cfg, self.t, list(boxes.values()))}
+        changed = False
         for box in self.st["checkboxes"]:
             if box.get("phase") in ("done", "deferred") or box.get("dispatch") or box["index"] not in boxes:
                 continue
-            box["kind"] = B.kind(self.cfg, self.t, boxes[box["index"]])
-            for kind in [k for k in (box.get("tasks") or {}) if (box["index"], k) not in kinds]:
-                orca.task_update(self.st["run_id"], box["tasks"].pop(kind), "completed",
+            kind = B.kind(self.cfg, self.t, boxes[box["index"]])
+            if box.get("kind") != kind:
+                self.log(f"#{box['index']} 종류 {box.get('kind')} → {kind} (현재 config)")
+                box["kind"], changed = kind, True
+            for k in [k for k in (box.get("tasks") or {}) if (box["index"], k) not in kinds]:
+                orca.task_update(self.st["run_id"], box["tasks"].pop(k), "completed",
                                  "cbd: 건너뜀 — config.json 변경으로 빠진 세션")
+                changed = True
         ig = self.st.get("integration")
         if ig and not ig.get("dispatch") and ig.get("phase") == "pending":  # the review has not started: follow config
-            for kind in [k for k in (ig.get("tasks") or {}) if (B.INTEGRATION, k) not in kinds]:
-                orca.task_update(self.st["run_id"], ig["tasks"].pop(kind), "completed",
+            for k in [k for k in (ig.get("tasks") or {}) if (B.INTEGRATION, k) not in kinds]:
+                orca.task_update(self.st["run_id"], ig["tasks"].pop(k), "completed",
                                  "cbd: 건너뜀 — config.json 변경으로 빠진 세션")
-        self.save()
-        self.precreate_tasks()
+                changed = True
+        if changed:
+            self.save()
 
     # ---- checkboxes
     def process_checkbox(self, c):

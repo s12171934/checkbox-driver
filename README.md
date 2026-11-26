@@ -49,7 +49,9 @@ status: active
   `work/<티켓>/<NN>/`(브리프·초안·findings·판정문, UI verify 는 `ui-scene.md`), `work/<티켓>/통합/`(통합 리뷰 findings·UI 캡처),
   `work/<티켓>/cumulative/<NN>.md`(누적 검증 결과), `work/<티켓>/contract/result.md`(실서버 대조 결과).
 - `config.json` 은 재기동 없이 반영된다: 스케줄러는 매 회차, 티켓 드라이버는 체크박스 경계마다 다시 읽는다(진행 중 체크박스의 세션은
-  그대로, JSON 오류면 직전 설정을 유지하고 경고 로그).
+  그대로, JSON 오류면 직전 설정을 유지하고 경고 로그). 드라이버 기동(멈춘 뒤 재기동 포함) 때도 같은 처리(`sync_kinds`)를 한 번 거친다 —
+  끝나지 않았고 dispatch 가 없는 체크박스의 종류(에이전트·드라이버 verify·드라이버 핀)를 현재 설정으로 다시 계산하고, 설정에서 빠진 세션
+  태스크는 닫는다. 예: UI verify 에서 멈춘 사이 티켓을 `ui_tickets` 에서 빼면 재기동 뒤 그 칸은 드라이버 verify 로 돈다.
 
 ## 규칙 (방식 문서와 같은 것)
 

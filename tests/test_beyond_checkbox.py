@@ -282,6 +282,24 @@ class UiSceneTest(Base):
         self.assertEqual(self.drive(fake), 2)
         self.assertEqual(self.store.ticket("A1")["exceptions"][-1]["kind"], "사람 판정")
 
+    def test_restart_recomputes_kind_after_the_ticket_leaves_ui_tickets(self):
+        """Stopped on a UI verify (agent kind, tasks cleared), then dropped from ui_tickets: the restart follows the
+        current config — #3 becomes a driver verify instead of an agent box without tasks (KeyError 'tasks')."""
+        fake = Fake(self.repo, {"no_stage": (3,), "scene": {3: ["판단 불가"]}})
+        self.assertEqual(self.drive(fake), 2)
+        st = self.store.ticket("A1")
+        c3 = next(c for c in st["checkboxes"] if c["index"] == 3)
+        self.assertEqual((c3["kind"], c3["phase"], c3.get("tasks")), ("agent", "pending", None))
+        self.conf(ui_tickets=[])
+        self.store.resolve(st)
+        started = len(fake.started)
+        self.assertEqual(self.drive(fake), 0, self.store.ticket("A1").get("exceptions"))
+        st = self.store.ticket("A1")
+        c3 = next(c for c in st["checkboxes"] if c["index"] == 3)
+        self.assertEqual(c3["kind"], "driver-verify")
+        self.assertNotIn("A1#3 구현 claude", fake.started[started:])
+        self.assertEqual(st["status"], "verified")
+
     def test_non_ui_ticket_verify_has_no_scene(self):
         self.conf(ui_tickets=[], agent_box_overrides=["A1#3"])
         fake = Fake(self.repo, {"no_stage": (3,)})
