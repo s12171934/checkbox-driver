@@ -7,7 +7,8 @@ At every checkbox boundary (and before finishing) boundary_rebase moves the bran
 when one appeared, and measures again what was green before (방식 · 같은 저장소 체인).
 A consumer ticket checks the producer's API on an isolated stack before its first checkbox (contract_check,
 체크박스를 넘는 검증 §1). A UI ticket's verify compares one scene with the design snapshot; a mismatch inserts a fix
-checkbox before the verify and runs the verify again (§2).
+checkbox before the verify and runs the verify again (§2). `cbd add-fix` lets the coordinator do the same for any
+checkbox (fix_source coordinator); the driver applies it at its start or next checkbox boundary.
 
 Beside the loop, every commit starts a cumulative check (one GPT session over base..commit) that the loop does not wait
 for; its problems go to the coordinator as alerts (state/alerts.jsonl kind 「cumulative」). The driver waits for the
@@ -184,6 +185,8 @@ class TicketDriver:
                 self.start_ticket()
                 self.ensure_run()
                 self.sync_kinds()
+                self.apply_fix_requests()
+                self.close_stale_tasks()
                 self.settle_accepted()
                 self.close_settled_tasks()
                 self.precreate_tasks()
@@ -210,6 +213,9 @@ class TicketDriver:
 
     def run_boxes(self):
         while True:
+            if self.apply_fix_requests():  # cbd add-fix while this driver ran: the boundary is now
+                self.close_stale_tasks()
+                self.precreate_tasks()
             self.settle_accepted()
             c = next((c for c in self.st["checkboxes"] if c.get("phase") not in SETTLED), None)
             if not c:
@@ -403,6 +409,8 @@ class TicketDriver:
     def fix_extra(self, c, review=False):
         if c.get("fix_source") == "ui_scene":
             return briefs.scene_fix_extra(c.get("scene_file") or "", review=review)
+        if c.get("fix_source") == "coordinator":
+            return briefs.coordinator_fix_extra(c.get("fix_file") or "", c.get("fix_for"), review=review)
         if c.get("fix_source") != "integration":
             return ""
         files = [briefs.integration_path(self.work(B.INTEGRATION), r) for r in (self.integ() or {}).get("findings", {})]
@@ -1081,6 +1089,129 @@ class TicketDriver:
                     f"수용으로 닫힘 — #{c.get('fix_for')} 화면 대조 수용: {(c.get('accepted') or {}).get('reason', '')}"
                 self.close_box_tasks(c, why)
 
+    # ---- 코디네이터 수정 칸: cbd add-fix puts an agent fix checkbox before checkbox n (a verify does not change code)
+    def apply_fix_requests(self, tolerant=False):
+        """Insert the fix boxes `cbd add-fix` asked for. Called at every start and checkbox boundary by the driver, and
+        by the command itself when no driver runs. Returns [(fix box index, n)] of the boxes inserted; a request that
+        can no longer apply (#n committed meanwhile) moves to rejected/ with an alert."""
+        if not self.st.get("checkboxes"):  # not started yet: applied right after the start
+            return []
+        added = []
+        for path, req in self.store.fix_requests(self.pkg):
+            n = (req or {}).get("n")
+            problem = self.fix_problem(n) if req else "요청 파일을 읽지 못함"
+            if problem:
+                self.store.fix_request_done(path, "rejected", reason=problem)
+                self.log(f"#{n} 앞 수정 칸 요청 거부 — {problem}")
+                self.store.alert(self.pkg, "add_fix", f"#{n} 앞 수정 칸 요청 거부 — {problem}", request=path)
+                continue
+            m = self.insert_fix(req, tolerant=tolerant)
+            self.store.fix_request_done(path, "applied", box=m)
+            added.append((m, n))
+        return added
+
+    def fix_problem(self, n):
+        """Why a fix box cannot go before checkbox n now, or None."""
+        c = next((x for x in self.st.get("checkboxes") or [] if x["index"] == n), None)
+        if c is None:
+            return f"#{n} 체크박스가 없다"
+        if c.get("phase") in SETTLED + ("skipped",) or c.get("commit"):
+            return f"#{n} 는 이미 {c.get('phase')}{' (커밋됨)' if c.get('commit') else ''} — 그 앞에 넣을 수 없다"
+        wt = self.st.get("worktree")
+        if c.get("dispatch") and wt and os.path.isdir(wt) and \
+                git(wt, "status", "--porcelain", "--untracked-files=no").strip():
+            return f"작업 트리에 #{n} 진행분 변경이 있다 — 비우거나 정리한 뒤 다시 요청"
+        return None
+
+    def insert_fix(self, req, tolerant=False):
+        """#n goes back to pending (as reset_box) and an agent fix box m goes before it (fix_source coordinator, the
+        order copied to work/<m>/fix-order.md). The unfinished tasks of #n are closed, and so are the not-yet-started
+        sessions that wait on them through deps (the next box, the integration review): Orca cannot change a task's
+        deps, so precreate_tasks registers them again on the new tasks. Closing that fails (a terminal fenced from the
+        Run) stays in state stale_tasks for the driver to close at its start. Returns m."""
+        n = req["n"]
+        c = self.box(n)
+        why = f"#{n} 앞 코디네이터 수정 칸"
+        rows = B.ticket_sessions(self.cfg, self.t, self._boxes())
+        waits = {r["key"] for r in rows if r["box"] == n}
+        for r in rows:  # start order: whatever waits on #n, directly or through another session
+            if r["box"] != n and waits & set(r["deps"]):
+                waits.add(r["key"])
+        stale = [tid for k, tid in (c.get("tasks") or {}).items() if tid and not (c.get("done") or {}).get(k)]
+        for r in rows:
+            rec = self.rec(r["box"]) if r["box"] != n and r["key"] in waits else None
+            if not rec or rec.get("dispatch") or rec.get("phase") in SETTLED + ("skipped", "fix"):
+                continue
+            tid = (rec.get("tasks") or {}).pop(r["kind"], None)
+            if tid:
+                stale.append(tid)
+        workers = [d for k, d in (c.get("dispatch") or {}).items() if d and k != "judge"]
+        handle = c.pop("impl_handle", None)
+        c.pop("tasks", None)
+        c.pop("dispatch", None)
+        rid = self.st.get("run_id")
+        self.st["stale_tasks"] = (self.st.get("stale_tasks") or []) + [
+            {"run": rid, "task": t, "why": f"다시 등록 — {why}"} for t in stale]
+        self.reset_box(c, why)
+        m = max(x["index"] for x in self.st["checkboxes"]) + 1
+        order = os.path.join(self.work(m), "fix-order.md")
+        write_text(order, req["text"])
+        self.st["checkboxes"].insert(self.st["checkboxes"].index(c), {
+            "index": m, "title": req["title"], "phase": "pending", "kind": B.AGENT, "fix_source": "coordinator",
+            "fix_for": n, "fix_file": order, "requested": {"at": req.get("at"), "by": req.get("by"),
+                                                           "source": req.get("source")}})
+        self.save()
+        self.log(f"수정 체크박스 #{m} 를 #{n} 앞에 넣음 (코디네이터, {order}) — #{n} 은 그 뒤 처음부터; "
+                 f"다시 등록할 태스크 {len(stale)}개")
+        cleanup = [(f"워커 {d}", orca.worker_release, d) for d in workers]
+        if handle:
+            cleanup.append((f"터미널 {handle}", orca.terminal_close, handle))
+        for what, fn, arg in cleanup:
+            try:
+                fn(arg)
+            except DriverError as e:
+                if not tolerant:
+                    raise
+                self.log(f"{what} 정리 실패 — {e.message[:200]}")
+        try:
+            self.jira.add_box(self.t.jira, req["title"])
+        except DriverError as e:
+            self.log(f"Jira 체크리스트에 #{m} 추가 실패 — {e.message}")
+        return m
+
+    def close_stale_tasks(self, tolerant=False):
+        """Complete the tasks insert_fix took out of state (stale_tasks). Entries of another Run (ensure_run made a new
+        one) or already completed are dropped. Returns the entries left open (only when tolerant)."""
+        stale = self.st.get("stale_tasks")
+        if not stale:
+            return []
+        rid = self.st.get("run_id")
+        left = []
+        try:
+            known = orca.task_list(rid) if rid else {}
+        except DriverError:
+            if not tolerant:
+                raise
+            return stale
+        for i, x in enumerate(stale):
+            if x.get("run") != rid or x["task"] not in known or known[x["task"]].get("status") == "completed":
+                continue
+            try:
+                orca.task_update(rid, x["task"], "completed", f"cbd: {x['why']}")
+            except DriverError as e:
+                if not tolerant:
+                    self.st["stale_tasks"] = left + stale[i:]
+                    self.save()
+                    raise
+                self.log(f"태스크 {x['task']} 를 지금 닫지 못함 — 드라이버가 기동 때 닫는다: {e.message[:200]}")
+                left.append(x)
+        if left:
+            self.st["stale_tasks"] = left
+        else:
+            self.st.pop("stale_tasks", None)
+        self.save()
+        return left
+
     def reset_box(self, c, why):
         """Put an agent checkbox back to pending: unfinished sessions are closed, the scene result is kept aside under
         a numbered name (so the next run's result is not confused with it). Returns that archived path."""
@@ -1329,6 +1460,21 @@ class TicketDriver:
         self.log(f"verified {self.st['verified_head'][:10]} — 체크박스 {len(done)}개"
                  + (f" (수용으로 닫힘 {accepted}개 별도)" if accepted else ""))
         self.notify(f"{self.pkg} verified")
+
+
+COORDINATOR_FIX_TITLE = "fix: 코디네이터 수정 지시 반영"
+
+
+def fix_title(text):
+    """Default title of a `cbd add-fix` box: the order's first line (a markdown heading mark dropped), kept as it is
+    when it already reads like a commit title (`fix(app): …`), else `fix: <line>`."""
+    line = next((x.strip() for x in (text or "").splitlines() if x.strip()), "")
+    line = re.sub(r"^#+\s*", "", line).strip()
+    if not line:
+        return COORDINATOR_FIX_TITLE
+    if re.match(r"^[a-z]+(\([^)]*\))?!?:\s*\S", line):
+        return line[:100]
+    return f"fix: {line}"[:100]
 
 
 def close_open_tasks(st, c, why):

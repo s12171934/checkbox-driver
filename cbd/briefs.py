@@ -269,6 +269,19 @@ def scene_fix_extra(scene_file, review=False):
 """
 
 
+def coordinator_fix_extra(order_file, fix_for, review=False):
+    what = ("스테이지된 변경이 아래 지시 파일의 요구를 모두 채우는지도 본다. 빠진 요구는 결함으로 적는다." if review else
+            f"아래 지시 파일대로 이 커밋 하나로 고친다 — #{fix_for} 가 이 수정 뒤에 다시 돈다. 지시 파일의 범위 밖은 고치지"
+            " 않는다. 기존 커밋을 고쳐 쓰지 않는다 — 수정은 이 체크박스의 새 커밋이다.")
+    return f"""
+## 이 체크박스는 코디네이터가 #{fix_for} 앞에 넣은 수정이다
+
+{what}
+
+- `{order_file or '(지시 파일 없음)'}`
+"""
+
+
 def contract_path(work):
     return os.path.join(work, "result.md")
 

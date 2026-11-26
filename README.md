@@ -1,7 +1,7 @@
 ---
 title: checkbox-driver
 created: 2026-11-10
-updated: 2026-11-26
+updated: 2026-11-27
 tags: [domain/인공지능, area/ai에이전트, type/설계, agent/claude-d8702234-c5f1-4d44-ab58-9d35f1de6a58]
 source: ai
 status: active
@@ -49,7 +49,7 @@ status: active
   (`{"producer": "R1", "apis": "M4 · M5 (§7)"}`)이 있으면 그것이 이기고, `false` 면 설계 줄이 있어도 하지 않는다. 계획에 없는
   생산자는 `check` 경고다.
 - 설정·상태: `~/.checkbox-driver/<키>/` (`CBD_HOME` 으로 바꿈) — `config.json`, `state/<티켓>.json`, `state/plan.json`(에이전트
-  대시보드 `external_plans` 계약), `state/state.md`, `state/replies/<run>/`, `state/ui-accept/`(화면 불일치 사람 수용), `logs/`,
+  대시보드 `external_plans` 계약), `state/state.md`, `state/replies/<run>/`, `state/ui-accept/`(화면 불일치 사람 수용), `state/fix-requests/<티켓>/`(add-fix 요청 — 적용 뒤 `applied/`·`rejected/`), `logs/`,
   `work/<티켓>/<NN>/`(브리프·초안·findings·판정문, UI verify 는 `ui-scene.md`), `work/<티켓>/통합/`(통합 리뷰 findings·UI 캡처),
   `work/<티켓>/cumulative/<NN>.md`(누적 검증 결과), `work/<티켓>/contract/result.md`(실서버 대조 결과).
 - `config.json` 은 재기동 없이 반영된다: 스케줄러는 매 회차, 티켓 드라이버는 체크박스 경계마다 다시 읽는다(진행 중 체크박스의 세션은
@@ -167,7 +167,7 @@ status: active
   ```
 
   `kind`: `blocked` · `question` · `escalation` · `auto_resolved` · `restart_limit` · `integration`(통합 리뷰 지적 → 수정 체크박스) ·
-  `ui_scene`(UI verify 화면 불일치 → 수정 체크박스) ·
+  `ui_scene`(UI verify 화면 불일치 → 수정 체크박스) · `add_fix`(add-fix 요청 거부 — #n 이 그 사이 커밋됨 등) ·
   `cumulative`(누적 검증 문제 — `problems`·`commit`·`path`, 또는 결과 없음·기동 실패). 질문은 `answer` 경로에 답을 쓰면 드라이버가 보낸다.
 
 ## 명령
@@ -181,7 +181,21 @@ cbd <키> launch <티켓> · run <티켓>                   # 하나만 띄우�
 cbd <키> status · plan                                # 현황 · plan.json/state.md 갱신
 cbd <키> approve <티켓> <번호> · resolve <티켓> · defer <티켓> <번호>
 cbd <키> accept-ui <티켓> <번호> <사유>               # UI verify 화면 불일치를 사람이 받아들임 (뒤에 resolve)
+cbd <키> add-fix <티켓> <번호> <지시 파일> [--title <제목>]   # #번호(보통 verify) 앞에 에이전트 수정 체크박스
 ```
+
+- `add-fix` 는 verify 처럼 코드를 고치지 않는 칸이 다른 원인(예: 핀 뒤 다른 티켓 범위 파일이 컴파일되지 않음)으로 넘어가지 못할 때
+  코디네이터가 그 앞에 수정 칸을 넣는 명령이다. 새 칸은 `fix_source: coordinator`·`fix_for: <번호>` 의 에이전트 박스로, 지시 파일은
+  `work/<티켓>/<새 번호>/fix-order.md` 로 복사돼 구현·리뷰 브리프에 들어간다. 제목 기본값은 지시 파일 첫 줄(머리글 `#` 제거)이고,
+  이미 `fix(app): …` 처럼 커밋 제목 꼴이면 그대로, 아니면 `fix: <첫 줄>`. Jira 체크리스트에도 줄을 더한다.
+  - #번호는 화면 대조 수정 때와 같은 방식(reset)으로 pending 이 되고 다시 처음부터 돈다. 그 칸의 미완료 Orca 태스크는 completed 로 닫고,
+    그 태스크를 deps 로 기다리던 아직 시작 안 한 세션(뒤 칸·사전 등록된 `<티켓>#통합 리뷰 *`)도 닫은 뒤 새 태스크에 deps 를 걸어 다시
+    등록한다 — Orca 는 태스크의 deps 를 바꿀 수 없어서다. 손으로 state 에서 태스크를 지우면 옛 태스크가 열린 채 남아 그것을 기다리는
+    태스크가 `task_not_startable` 로 선다(PRD-94 D1).
+  - 드라이버가 돌고 있으면 요청 파일만 남기고 드라이버가 다음 체크박스 경계에서 넣는다(그 사이 #번호가 커밋되면 `rejected/` 와
+    `add_fix` 알림). 멈춰 있으면 바로 넣고 resolve 를 안내한다. 태스크 닫기(task-update)는 Run 에 묶인 드라이버 터미널 밖에서는
+    막힐 수 있어(consumer_fenced) 닫지 못한 것은 state `stale_tasks` 에 남기고 드라이버가 기동 때 닫는다.
+  - 이미 done·accepted·deferred 인 칸, 진행분 변경이 작업 트리에 남은 칸 앞에는 넣지 않는다.
 
 - `defer` 는 그 칸을 `deferred` 로 두고 미완료 Orca 태스크를 completed(`미룸`)로 닫는다 — 열어 두면 뒤 칸 태스크가 그 태스크를 dep 으로
   가져 pending(`task_not_startable`)으로 멈춘다. 닫기가 막히면(consumer_fenced) 드라이버가 기동 때 닫는다. 미룬 칸이 남으면 티켓은

@@ -410,5 +410,130 @@ class UiSceneTest(Base):
         self.assertNotIn("화면 한 장면 대조", _read(os.path.join(self.cfg.work_dir, "A1", "03", "impl-brief.md")))
 
 
+class DepFake(Fake):
+    """+ Orca's dependency rule: a task whose deps are not all completed is not startable (task_not_startable)."""
+
+    def task_create(self, rid, title, spec, deps):
+        tid = super().task_create(rid, title, spec, deps)
+        self.tasks[tid]["deps"] = list(deps or [])
+        return tid
+
+    def worker_start(self, rid, tid, *a, **k):
+        if not k.get("retry_of"):
+            waiting = [d for d in self.tasks[tid].get("deps", []) if self.tasks[d]["status"] != "completed"]
+            if waiting:
+                raise orca_error("task_not_startable", f"Task {tid} has unfinished deps {waiting}")
+        return super().worker_start(rid, tid, *a, **k)
+
+
+def orca_error(code, message):
+    from cbd import orca
+    return orca.OrcaError(code, message)
+
+
+class AddFixTest(Base):
+    """PRD-94 D1: the agent verify #3 cannot pass (the implementer leaves no result — e.g. tsc fails in files of another
+    ticket) and a verify never changes code, so the coordinator puts a fix checkbox before it with `cbd add-fix`."""
+
+    def setUp(self):
+        super().setUp()
+        self.conf(agent_box_overrides=["A1#3"])
+        self.order = os.path.join(self.home, "fix-order.md")
+        with open(self.order, "w") as f:
+            f.write("# tsc 오류 정리 — 핀 뒤 컴파일 안 되는 파일\n\n- `src/x.ts` 의 타입을 맞춘다\n")
+
+    def stalled_verify(self):
+        fake = DepFake(self.repo, {"no_stage": (3,), "no_test_result": (3,)})
+        self.assertEqual(self.drive(fake), 2)
+        st = self.store.ticket("A1")
+        self.assertIn("test-result.md", st["exceptions"][-1]["message"])
+        self.assertTrue(self.open_tasks(fake, 3))
+        return fake
+
+    cli = UiSceneTest.cli
+    open_tasks = UiSceneTest.open_tasks
+
+    def integration_deps(self, fake):
+        ig = self.store.ticket("A1")["integration"]
+        return {k: fake.tasks[t]["deps"] for k, t in ig["tasks"].items()}
+
+    def finish(self, fake):
+        fake.behaviour["no_test_result"] = ()
+        self.store.resolve(self.store.ticket("A1"))
+        self.assertEqual(self.drive(fake), 0, self.store.ticket("A1").get("exceptions"))
+        st = self.store.ticket("A1")
+        self.assertEqual(st["status"], "verified")
+        self.assertEqual([c["index"] for c in st["checkboxes"]], [1, 2, 4, 3])
+        self.assertEqual(self.subjects(), ["[EX-1] verify: A1 테스트 그린", "[EX-1] fix: tsc 오류 정리 — 핀 뒤 컴파일 안 되는 파일",
+                                           "[EX-1] feat(core): 모델 추가", "[EX-1] test(core): TC-A-01~TC-A-03 빨강"])
+        # no task of the Run is left open (an orphaned dep would have stopped the integration review)
+        self.assertEqual({t: v["status"] for t, v in fake.tasks.items() if v["status"] != "completed"}, {})
+        c3 = next(c for c in st["checkboxes"] if c["index"] == 3)
+        judge3 = c3["tasks"]["judge"]
+        self.assertEqual({tuple(d) for d in self.integration_deps(fake).values()}, {(judge3,)})
+        return st
+
+    def test_stopped_driver_applies_at_once_and_the_restart_runs_the_fix_before_verify(self):
+        fake = self.stalled_verify()
+        old3 = dict(next(c for c in self.store.ticket("A1")["checkboxes"] if c["index"] == 3)["tasks"])
+        old_ig = dict(self.store.ticket("A1")["integration"]["tasks"])
+        self.assertEqual(self.cli(fake, "add-fix", "A1", "3", self.order), 0)
+        st = self.store.ticket("A1")
+        self.assertEqual([c["index"] for c in st["checkboxes"]], [1, 2, 4, 3])
+        fix, c3 = st["checkboxes"][2], st["checkboxes"][3]
+        self.assertEqual((fix["fix_source"], fix["fix_for"], fix["kind"], fix["phase"]), ("coordinator", 3, "agent", "pending"))
+        self.assertEqual(fix["title"], "fix: tsc 오류 정리 — 핀 뒤 컴파일 안 되는 파일")
+        self.assertIn("src/x.ts", _read(fix["fix_file"]))
+        self.assertEqual(c3["phase"], "pending")
+        for k in ("tasks", "dispatch", "done", "retries"):
+            self.assertNotIn(k, c3)
+        # #3's unfinished tasks and the integration review tasks that depended on them are closed in Orca
+        for tid in [*old3.values(), *old_ig.values()]:
+            self.assertEqual(fake.tasks[tid]["status"], "completed")
+        self.assertFalse(st["integration"].get("tasks"))
+        st = self.finish(fake)
+        brief = _read(os.path.join(self.cfg.work_dir, "A1", "04", "impl-brief.md"))
+        self.assertIn(fix["fix_file"], brief)
+        self.assertIn("코디네이터", brief)
+        self.assertIn(fix["fix_file"], _read(os.path.join(self.cfg.work_dir, "A1", "04", "review-codex-brief.md")))
+
+    def test_fenced_coordinator_leaves_the_task_closing_to_the_driver(self):
+        fake = self.stalled_verify()
+        old = [*next(c for c in self.store.ticket("A1")["checkboxes"] if c["index"] == 3)["tasks"].values(),
+               *self.store.ticket("A1")["integration"]["tasks"].values()]
+        self.assertEqual(self.cli(fake, "add-fix", "A1", "3", self.order, fenced=True), 0)
+        st = self.store.ticket("A1")
+        self.assertEqual([c["index"] for c in st["checkboxes"]], [1, 2, 4, 3])
+        self.assertTrue(any(fake.tasks[t]["status"] != "completed" for t in old))
+        self.assertEqual(sorted(x["task"] for x in st["stale_tasks"]),
+                         sorted(t for t in old if fake.tasks[t]["status"] != "completed"))
+        st = self.finish(fake)
+        self.assertNotIn("stale_tasks", st)
+
+    def test_running_driver_applies_the_request_at_the_next_boundary(self):
+        fake = DepFake(self.repo, {"no_stage": (3,)})
+        title = "fix(core): 타입 정리"
+        fake.after_judge = {1: lambda: self.assertEqual(
+            self.cli(fake, "add-fix", "A1", "3", self.order, "--title", title), 0)}
+        self.assertEqual(self.drive(fake), 0, self.store.ticket("A1").get("exceptions"))
+        st = self.store.ticket("A1")
+        self.assertEqual(st["status"], "verified")
+        self.assertEqual([c["index"] for c in st["checkboxes"]], [1, 2, 4, 3])
+        self.assertEqual(self.subjects(), ["[EX-1] verify: A1 테스트 그린", f"[EX-1] {title}",
+                                           "[EX-1] feat(core): 모델 추가", "[EX-1] test(core): TC-A-01~TC-A-03 빨강"])
+        self.assertEqual(os.listdir(self.store.p("fix-requests", "A1")), ["applied"])
+
+    def test_refuses_a_committed_box(self):
+        fake = self.stalled_verify()
+        self.assertNotEqual(self.cli(fake, "add-fix", "A1", "1", self.order), 0)
+        self.assertEqual([c["index"] for c in self.store.ticket("A1")["checkboxes"]], [1, 2, 3])
+
+    def test_default_title(self):
+        from cbd.ticket import fix_title
+        self.assertEqual(fix_title("## tsc 오류 정리\n본문"), "fix: tsc 오류 정리")
+        self.assertEqual(fix_title("\n\nfix(app): 타입 맞춤\n"), "fix(app): 타입 맞춤")
+        self.assertEqual(fix_title(""), "fix: 코디네이터 수정 지시 반영")
+
+
 if __name__ == "__main__":
     unittest.main()

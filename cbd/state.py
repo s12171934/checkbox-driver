@@ -6,6 +6,7 @@ state/events.json      the last 40 events across tickets
 state/run-<PKG>.json   {run_id, terminal} of the ticket's Orca Run (the dashboard globs run-*.json)
 state/approvals/       <PKG>-<n> files written by `cbd approve`
 state/ui-accept/       <PKG>-<n>.json — a person's acceptance of a UI verify scene mismatch (`cbd accept-ui`)
+state/fix-requests/<PKG>/  `cbd add-fix` requests not yet applied; applied/ and rejected/ keep the handled ones
 state/replies/<run>/   <msg>.question.md from workers, <msg>.md answers to send, task_<id>.complete.md
 state/scheduler.json   the scheduler terminal and the coordinator session that owns the plan
 state/alerts.jsonl     one JSON line per stop or open question (config "alerts": false turns it off)
@@ -97,6 +98,26 @@ class Store:
 
     def ui_accept(self, package, n, reason, by="user"):
         write_json(self.p("ui-accept", f"{package}-{n}.json"), {"at": now_iso(), "by": by, "reason": reason})
+
+    # ---- coordinator fix boxes (cbd add-fix): a request file the ticket driver (or the command, when no driver runs)
+    #      applies at a checkbox boundary; then it moves to applied/ or rejected/ under the same directory
+    def fix_request(self, package, n, title, text, source, by="user"):
+        d = self.p("fix-requests", package)
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, f"{now_ts():.6f}-{n}-{os.getpid()}.json")
+        write_json(path, {"n": n, "title": title, "text": text, "source": source, "at": now_iso(), "by": by})
+        return path
+
+    def fix_requests(self, package):
+        d = self.p("fix-requests", package)
+        names = sorted(f for f in os.listdir(d) if f.endswith(".json")) if os.path.isdir(d) else []
+        return [(os.path.join(d, f), read_json(os.path.join(d, f))) for f in names]
+
+    def fix_request_done(self, path, outcome, **extra):
+        req = read_json(path) or {}
+        d = os.path.join(os.path.dirname(path), outcome)
+        write_json(os.path.join(d, os.path.basename(path)), {**req, outcome: now_iso(), **extra})
+        os.remove(path)
 
     # ---- runs
     def run_file(self, package):

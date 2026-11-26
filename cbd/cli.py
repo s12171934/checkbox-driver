@@ -11,6 +11,9 @@
   approve   <PKG> <n>                              human approval for checkbox n
   accept-ui <PKG> <n> <사유>                        a person accepts the UI verify scene mismatch of checkbox n; the
                                                    uncommitted fix boxes inserted for it close as 수용으로 닫힘
+  add-fix   <PKG> <n> <지시 파일> [--title T]        put an agent fix checkbox before checkbox n (usually a verify); n
+                                                   goes back to pending, its tasks and the ones waiting on them are
+                                                   registered again — a running driver applies it at its next boundary
   resolve   <PKG>                                  close a ticket's open exceptions so the scheduler may relaunch it
   defer     <PKG> <n>                              skip checkbox n for now (the ticket stops on box_deferred at the end)
 """
@@ -311,6 +314,58 @@ def cmd_accept_ui(a):
     print(f"{a.package}#{a.n} 화면 대조 수용 기록 — 멈춰 있었다면 cbd {a.key} resolve {a.package}")
 
 
+def cmd_add_fix(a):
+    """Put an agent fix checkbox before checkbox n (usually a verify, which never changes code). A running driver
+    applies the request at its next checkbox boundary; otherwise it is applied here at once (the driver, the Run's
+    consumer, closes at its start whatever task this terminal could not close)."""
+    cfg, design, store = load(a.key)
+    from cbd.state import TicketLock
+    from cbd.ticket import TicketDriver, fix_title
+    if a.package not in design.tickets:
+        raise DriverError("입력", f"{a.package} 는 설계 계획에 없다")
+    try:
+        with open(a.order, encoding="utf-8") as f:
+            text = f.read()
+    except OSError as e:
+        raise DriverError("입력", f"지시 파일을 읽지 못함 {a.order}: {e}")
+    if not text.strip():
+        raise DriverError("입력", f"지시 파일이 비어 있다 {a.order}")
+    title = (a.title or "").strip() or fix_title(text)
+    st = store.ticket(a.package)
+    box = next((c for c in st.get("checkboxes") or [] if c["index"] == a.n), None)
+    if st.get("checkboxes") and not box:
+        raise DriverError("입력", f"{a.package}#{a.n} 가 없다")
+    if box and (box.get("phase") in ("done", "deferred", "accepted", "skipped") or box.get("commit")):
+        raise DriverError("입력", f"{a.package}#{a.n} 는 이미 {box.get('phase')} — 그 앞에 수정 칸을 넣을 수 없다")
+    path = store.fix_request(a.package, a.n, title, text, os.path.abspath(a.order),
+                             by=os.environ.get("ORCA_TERMINAL_HANDLE") or "user")
+    store.event(a.package, f"#{a.n} 앞 수정 칸 요청 — {title[:80]}")
+    lock = TicketLock(store, a.package)
+    if not lock.acquire():
+        busy = " (#{} 가 이미 진행 중이면 그 칸이 커밋된 뒤에는 넣지 못하고 요청은 rejected 로 남는다)".format(a.n) \
+            if box and box.get("dispatch") else ""
+        print(f"{a.package} 드라이버가 돌고 있다 — 다음 체크박스 경계에서 #{a.n} 앞에 「{title}」 를 넣는다{busy}\n요청 {path}")
+        return 0
+    try:
+        if not st.get("checkboxes"):
+            print(f"{a.package} 착수 전 — 드라이버가 착수 직후 #{a.n} 앞에 「{title}」 를 넣는다\n요청 {path}")
+            return 0
+        d = TicketDriver(cfg, design, store, a.package)
+        added = d.apply_fix_requests(tolerant=True)
+        left = d.close_stale_tasks(tolerant=True)
+    finally:
+        lock.release()
+    P.write(cfg, design, store, orca.live_handles())
+    mine = [m for m, n in added if n == a.n]
+    if not mine:
+        raise DriverError("입력", f"요청이 거부됐다 — {os.path.dirname(path)}/rejected/ 참고")
+    if left:
+        print(f"태스크 {len(left)}개를 이 터미널에서 닫지 못함 — 드라이버가 기동 때 닫고 다시 등록한다")
+    print(f"수정 체크박스 #{mine[-1]} 「{title}」 를 #{a.n} 앞에 넣었다 (#{a.n} 은 pending) — "
+          f"멈춰 있었다면 cbd {a.key} resolve {a.package}")
+    return 0
+
+
 def cmd_resolve(a):
     cfg, design, store = load(a.key)
     st = store.ticket(a.package)
@@ -365,6 +420,11 @@ def main(argv=None):
     s.add_argument("package")
     s.add_argument("n", type=int)
     s.add_argument("reason", nargs="+")
+    s = sub.add_parser("add-fix")
+    s.add_argument("package")
+    s.add_argument("n", type=int)
+    s.add_argument("order", help="수정 지시 파일 (수정 브리프에 들어간다)")
+    s.add_argument("--title", help="체크박스·커밋 제목 (기본: fix: <지시 파일 첫 줄>)")
     a = ap.parse_args(argv)
     fn = globals()[f"cmd_{a.cmd.replace('-', '_')}"]
     try:
