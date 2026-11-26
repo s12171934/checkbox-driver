@@ -52,7 +52,7 @@ def goals_text(goals):
 
 def reading(design, ticket, titles=()):
     """The ticket's 읽을 문서 text. A single-doc design adds the parts of design.md its text cites (contract sections,
-    TC rows, inventory rows) as heading names, so a worker told not to open anything else can still read its contract.
+    TC rows, inventory rows) and its bold track block with its section's first paragraph, as heading names, so a worker told not to open anything else can still read its contract.
     Multi-doc designs get the ticket-index section unchanged."""
     text = ticket.index_section or "(ticket-index 절 없음)"
     allow = design.read_allowance(ticket, titles)
@@ -61,8 +61,8 @@ def reading(design, ticket, titles=()):
     items = "\n".join(f"- {a}" for a in allow)
     return f"""{text}
 
-읽어도 되는 설계 절 — `{os.path.join(design.root, 'design.md')}` 에서 아래 머리글의 절·표 행까지 연다(위 체크리스트·검증
-목표가 가리키는 계약 · 테스트 케이스 · 인벤토리). 그 밖의 절은 열지 않는다.
+읽어도 되는 설계 절 — `{os.path.join(design.root, 'design.md')}` 에서 아래 머리글의 절·블록·표 행까지 연다(위 체크리스트·
+검증 목표가 가리키는 계약 · 이 티켓의 트랙 블록과 그 절의 공통 규칙 · 테스트 케이스 · 인벤토리). 그 밖의 절은 열지 않는다.
 
 {items}"""
 

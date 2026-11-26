@@ -136,6 +136,7 @@ class ReadAllowanceTest(unittest.TestCase):
             "「11.2 front-common (presentational only)」 중 F3 부분 (§11.2 F3)",
             "「13. Storybook 컴포넌트 인벤토리」 (§13)",
             "§99 — design.md 에 이 번호의 머리글이 없다",
+            "「11.2 front-common (presentational only)」 의 **F3 `Consent`** 블록 (:15 부터 다음 굵은 패키지 블록·머리글 전까지)",
             "「14.2 front-common — Storybook `play`」 표의 TF-20 · TF-21 행 (테스트 케이스)",
             "「13. Storybook 컴포넌트 인벤토리」 표의 F3 행 — `Consent` · `ConsentCard` (F3) / `RAInputStep` (F3 슬롯)",
         ])
@@ -169,6 +170,154 @@ class ReadAllowanceTest(unittest.TestCase):
             self.assertIn(os.path.join(self.root, "design.md"), text, kind)
             self.assertIn("「11.2 front-common (presentational only)」 중 F3 부분", text, kind)
             self.assertNotIn("**F3 `Consent`** 계약", text, kind)  # names only, the section text is not pasted
+
+
+TRACK_DOC = """\
+# [EX-95] 예시 — 트랙 블록
+
+## 10. 서버 트랙 (`core`)
+
+| 파일 | 변경 |
+| --- | --- |
+| `app/x.rb` | 신규 |
+
+## 11. 클라이언트 트랙
+
+### 11.2 front-common (presentational only)
+
+fc 부품은 상태를 갖지 않는다. 문구의 정본은 §13 이다.
+
+**F1 `Visibility`** (신규)
+
+```ts
+# 주석이지 머리글이 아니다
+export interface VisibilityProps {}
+```
+
+**F4 활동 정보·학생 준비 팝업** (수정·신규)
+
+```ts
+// **F9 이건 코드 안 — 블록 끝이 아니다
+export interface GuideProps {}
+```
+
+- F4 본문 줄
+
+**F40 다른 패키지** (신규)
+
+### 11.3 대시보드 (`dash`)
+
+**D1 세션 보내기** — `Dialog.tsx`
+
+- D1 본문 (**D0** 은 줄 첫머리가 아니다)
+
+**D2 관찰** — `Observe.tsx`
+
+## 13. Storybook 컴포넌트 인벤토리
+
+| 부품 | 스토리 | 대표 노드 |
+| --- | --- | --- |
+| `Guide` (F4) | Default | `1:1` |
+
+## 16. Jira 티켓 맵
+
+| 티켓 | 저장소 | 브랜치 | 베이스/스택 부모 | 대상 테스트 | is blocked by |
+| --- | --- | --- | --- | --- | --- |
+| EX-1 F1 열람 | `fc` | `EX-1-f1` | `main` | — | — |
+| EX-2 F4 활동 정보 | `fc` | `EX-2-f4` | F1 | — | — |
+| EX-3 D1 세션 보내기 | `dash` | `EX-3-d1` | `develop` | — | — |
+| EX-4 R1 서버 | `core` | `EX-4-r1` | `develop` | — | — |
+
+### 16.2 커밋 체크리스트
+
+F1 — EX-1 · `EX-1-f1`
+
+```
+[ ] feat(fc): Visibility
+[ ] 완료
+```
+
+F4 — EX-2 · `EX-2-f4`
+
+```
+[ ] feat(fc): 활동 정보 Guide
+[ ] verify: Storybook↔Figma 대조(§13)
+[ ] 완료
+```
+
+D1 — EX-3 · `EX-3-d1`
+
+```
+[ ] feat(dash): 세션 보내기
+[ ] 완료
+```
+
+R1 — EX-4 · `EX-4-r1`
+
+```
+[ ] feat(core): 서버
+[ ] 완료
+```
+"""
+
+
+class TrackBlockTest(unittest.TestCase):
+    """PRD-94 F4#1: the F4 checklist cites only §13, so the brief allowed §13 and the worker stopped to ask whether it
+    may read the F4 part of §11.2. The ticket's bold track block (and its section's common first paragraph) is allowed."""
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self.root = os.path.join(self.home, "design")
+        os.makedirs(self.root)
+        with open(os.path.join(self.root, "design.md"), "w", encoding="utf-8") as f:
+            f.write(TRACK_DOC)
+        self.design = Design(self.root, TC)
+        self.cfg = config(self.home, self.root)
+
+    def tearDown(self):
+        shutil.rmtree(self.home)
+
+    def line(self, text):
+        return TRACK_DOC.splitlines().index(text) + 1
+
+    def test_block_and_common_paragraph_are_allowed(self):
+        allow = self.design.read_allowance(self.design.tickets["F4"])
+        head = "「11.2 front-common (presentational only)」"
+        self.assertEqual(allow, [
+            "「13. Storybook 컴포넌트 인벤토리」 (§13)",
+            f"{head} 의 **F4 활동 정보·학생 준비 팝업** 블록 (:{self.line('**F4 활동 정보·학생 준비 팝업** (수정·신규)')}"
+            " 부터 다음 굵은 패키지 블록·머리글 전까지)",
+            f"{head} 첫 문단 (:{self.line('fc 부품은 상태를 갖지 않는다. 문구의 정본은 §13 이다.')} — 이 절 패키지 블록의 공통 규칙)",
+            "「13. Storybook 컴포넌트 인벤토리」 표의 F4 행 — `Guide` (F4)",
+        ])
+
+    def test_block_bounds(self):
+        blocks = self.design.track_blocks()
+        f4 = blocks["F4"][0]
+        start = self.line("**F4 활동 정보·학생 준비 팝업** (수정·신규)")
+        self.assertEqual((f4["line"], f4["end"]), (start, self.line("- F4 본문 줄")))  # trailing blank lines dropped
+        d1 = blocks["D1"][0]
+        self.assertEqual(d1["end"], self.line("- D1 본문 (**D0** 은 줄 첫머리가 아니다)"))
+        self.assertNotIn("D0", blocks)       # inline bold, not a block
+        self.assertNotIn("F9", blocks)       # inside a code fence
+        self.assertEqual(blocks["F40"][0]["end"], self.line("**F40 다른 패키지** (신규)"))
+
+    def test_section_without_common_paragraph_adds_only_the_block(self):
+        allow = self.design.read_allowance(self.design.tickets["D1"])
+        self.assertEqual(allow, [
+            f"「11.3 대시보드 (`dash`)」 의 **D1 세션 보내기** 블록 (:{self.line('**D1 세션 보내기** — `Dialog.tsx`')}"
+            " 부터 다음 굵은 패키지 블록·머리글 전까지)",
+        ])
+
+    def test_ticket_without_block_is_unchanged(self):
+        self.assertEqual(self.design.read_allowance(self.design.tickets["R1"]), [])
+
+    def test_impl_brief_names_the_block_without_its_text(self):
+        f4 = self.design.tickets["F4"]
+        text = briefs.impl(self.cfg, self.design, f4, f4.boxes[0], self.home, os.path.join(self.home, "work"))
+        self.assertIn("**F4 활동 정보·학생 준비 팝업** 블록", text)
+        self.assertIn("첫 문단", text)
+        self.assertNotIn("F4 본문 줄", text)
 
 
 class MultiDocUnchangedTest(unittest.TestCase):

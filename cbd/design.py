@@ -20,8 +20,10 @@ Section numbers move between projects, so sections are found by heading words an
 - 테스트 케이스 section: TC rows, as tests/*.md.
 
 A single-doc brief cannot point at per-ticket files, so read_allowance names what a ticket's agents may open besides its
-own checklist and tree row: the sections its text cites (「(§11.2 F3)」), the test-case table rows of its TC IDs and its
-rows of an 「인벤토리」 table — heading names only, the section text is not pasted into the brief.
+own checklist and tree row: the sections its text cites (「(§11.2 F3)」), the test-case table rows of its TC IDs, its
+rows of an 「인벤토리」 table, and its bold track block (a line starting 「**F4 …**」 inside a track section, up to the next
+bold package block or heading) with the first paragraph of the section holding it (the rule shared by that section's
+blocks) — heading names and line numbers only, the section text is not pasted into the brief.
 
 Column positions differ between projects, so every table is read by its header names.
 """
@@ -35,6 +37,7 @@ from cbd.util import DriverError
 DASH = {"", "—", "-", "–"}
 SECTION_REF = re.compile(r"§\s*(\d+(?:\.\d+)*)(?:\s+([A-Z][A-Z0-9]*\d+[A-Za-z]?)(?![\w-]))?")
 NUMBERED_HEADING = re.compile(r"^#+\s+((\d+(?:\.\d+)*)\.?\s+.*?)\s*$")
+BLOCK_START = re.compile(r"^(\*\*([A-Z][A-Z0-9]*\d+[A-Za-z]?)(?=[\s`*·—(]).*?\*\*)")
 LAYER_WORDS = ("unit", "integration", "storybook", "e2e", "request", "system", "component", "contract")
 
 
@@ -234,6 +237,7 @@ class Design:
         self.notices = []          # printed by check without failing it (a ticket with no 검증 목표)
         self._tc_rows = None
         self._headings = None
+        self._blocks = None
         if self.single_doc:
             self._read_single_doc()
         else:
@@ -610,10 +614,57 @@ class Design:
                     self._headings.setdefault(m.group(2), m.group(1))
         return self._headings
 
+    def track_blocks(self):
+        """{'F4': [{'heading', 'title', 'line', 'end', 'para'}]} — bold package blocks of design.md: a line starting
+        「**<PKG> …**」 (outside code fences) up to the line before the next such block or heading. `heading` is the
+        heading the block sits under, `para` the line of that section's first paragraph when the section opens with
+        prose (its common rule) rather than a block, table or code (None otherwise). Line numbers are 1-based."""
+        if self._blocks is not None:
+            return self._blocks
+        self._blocks, fence, heading, para, cur = {}, False, "", None, None
+        lines = self.text("design.md").splitlines()
+
+        def close(end):
+            if cur:
+                cur["end"] = end
+        first = True                         # the next non-blank line is the first one under the heading
+        for i, line in enumerate(lines, 1):
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                fence = not fence
+                first = False
+                continue
+            if fence:
+                continue
+            h = re.match(r"^#+\s+(.*?)\s*$", line)
+            if h:
+                close(i - 1)
+                cur, heading, para, first = None, h.group(1), None, True
+                continue
+            b = BLOCK_START.match(line)
+            if b:
+                close(i - 1)
+                cur = {"heading": heading, "title": b.group(1), "line": i, "end": len(lines), "para": para}
+                self._blocks.setdefault(b.group(2), []).append(cur)
+                first = False
+                continue
+            if first and stripped:
+                first = False
+                if not stripped.startswith(("|", "<")):
+                    para = i
+        close(len(lines))
+        for blocks in self._blocks.values():   # trailing blank lines are not part of a block
+            for blk in blocks:
+                while blk["end"] > blk["line"] and not lines[blk["end"] - 1].strip():
+                    blk["end"] -= 1
+        return self._blocks
+
     def read_allowance(self, ticket, titles=()):
         """Single-doc only: [line] naming the parts of design.md the ticket's agents may read besides its checklist and
         tree row — (a) every 「§N」/「§N.M」 its text, checklist titles and `titles` cite, (b) the test-case table rows
-        of its TC IDs, (c) its rows of an 「인벤토리」 table. Heading names only (the brief stays small); [] otherwise."""
+        of its TC IDs, (c) its rows of an 「인벤토리」 table, (d) its bold track blocks 「**<PKG> …**」 and (e) the first
+        paragraph of the section holding each block. Heading names and line numbers only (the brief stays small);
+        [] otherwise."""
         if not self.single_doc:
             return []
         out, heads = [], self.numbered_headings()
@@ -625,6 +676,13 @@ class Design:
             cite = f"§{num}" + (f" {part}" if part else "")
             out.append(f"「{heads[num]}」" + (f" 중 {part} 부분" if part else "") + f" ({cite})" if num in heads else
                        f"{cite} — design.md 에 이 번호의 머리글이 없다")
+        for blk in self.track_blocks().get(ticket.package, []):
+            where = f"「{blk['heading']}」" if blk["heading"] else "design.md"
+            out.append(f"{where} 의 {blk['title']} 블록 (:{blk['line']} 부터 다음 굵은 패키지 블록·머리글 전까지)")
+            if blk["para"]:
+                para = f"{where} 첫 문단 (:{blk['para']} — 이 절 패키지 블록의 공통 규칙)"
+                if para not in out:
+                    out.append(para)
         tcs = list(dict.fromkeys([*ticket.tcs, *expand_tcs(text, self.tc_pattern)]))
         rows, by_heading = self.tc_rows(), {}
         for tc in tcs:
