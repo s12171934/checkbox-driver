@@ -11,7 +11,7 @@ DEFAULTS = {
     "max_restarts": 3,
     "hold": {},                     # package -> reason: never launched by the scheduler, only by `launch`
     "start_waived": {},             # package -> [predecessors the start does not wait for]
-    "chain_serial": False,          # a ticket also waits for its chain prev (no boundary rebase: keeps the stack stacked)
+    "chain_serial": False,          # a ticket also waits for its chain prev (strict stack: never needs a boundary rebase)
     "box_prereqs": {},              # "PKG#n" -> [packages that must be verified before that checkbox]
     "approval_boxes": [],           # "PKG#n" checkboxes that need `cbd approve` before they run
     "agent_box_overrides": [],      # "PKG#n" checkboxes run by an agent although their prefix is a driver prefix
@@ -33,6 +33,9 @@ DEFAULTS = {
     "ui_snapshots": ["snapshots/{pkg}", "design-snapshots/{pkg}"],  # design-root dirs of exported Figma frames
     "integration_fix_title": "fix: 티켓 통합 리뷰 지적 반영",
     "cumulative_check": {"enabled": True, "reviewer": "codex"},  # GPT check of base..commit after every commit
+    "ui_scene_max_fix": 2,          # UI verify scene mismatches fixed by added checkboxes before a person must judge
+    "ui_scene_fix_title": "fix: 화면 대조 불일치 반영",
+    "contract_checks": {},          # package -> {"producer": PKG | [PKG], "apis": text} | false; overrides the design line
     "alerts": True,                 # append stops and worker questions to state/alerts.jsonl
     "auto_resolve": {"after_sec": 900, "max": 3},  # scheduler reopens a retryable stop after_sec later, max times
 }

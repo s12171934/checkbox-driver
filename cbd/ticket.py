@@ -1,7 +1,13 @@
 """The ticket driver: `cbd <project> run <PKG>`, one process per ticket in its own Orca terminal.
 
-start_ticket -> ensure_run -> precreate_tasks -> process_checkbox x N -> integration_review
-  [-> fix checkbox -> remeasure] -> finish_ticket
+start_ticket -> ensure_run -> precreate_tasks -> contract_check -> process_checkbox x N -> integration_review
+  [-> fix checkbox -> remeasure] -> finish_ticket (verified, or rebase_pending while the chain prev is not verified)
+
+At every checkbox boundary (and before finishing) boundary_rebase moves the branch onto a nearer verified chain head
+when one appeared, and measures again what was green before (방식 · 같은 저장소 체인).
+A consumer ticket checks the producer's API on an isolated stack before its first checkbox (contract_check,
+체크박스를 넘는 검증 §1). A UI ticket's verify compares one scene with the design snapshot; a mismatch inserts a fix
+checkbox before the verify and runs the verify again (§2).
 
 Beside the loop, every commit starts a cumulative check (one GPT session over base..commit) that the loop does not wait
 for; its problems go to the coordinator as alerts (state/alerts.jsonl kind 「cumulative」). The driver waits for the
@@ -24,7 +30,7 @@ from cbd.design import expand_tcs
 from cbd.gates import Gate
 from cbd.jira import Jira
 from cbd.select import base_for, repo_base
-from cbd.state import BLOCKED, BOX_WAITING, DONE_STATUSES, RUNNING, VERIFIED, TicketLock
+from cbd.state import BLOCKED, BOX_WAITING, DONE_STATUSES, REBASE_PENDING, RUNNING, VERIFIED, TicketLock
 from cbd.util import DriverError, git, now_iso, now_ts, run, write_text
 
 
@@ -38,6 +44,10 @@ class BoxWait(Exception):
         super().__init__(why)
         self.packages = packages
         self.why = why
+
+
+class Requeue(Exception):
+    """Checkboxes were inserted before the current one (UI verify scene mismatch): pick the next pending box again."""
 
 
 class TicketDriver:
@@ -146,6 +156,7 @@ class TicketDriver:
                 self.start_ticket()
                 self.ensure_run()
                 self.precreate_tasks()
+                self.contract_check()
                 self.run_boxes()
                 if self.integration_review():
                     self.precreate_tasks()
@@ -167,11 +178,18 @@ class TicketDriver:
                 time.sleep(delay)
 
     def run_boxes(self):
-        for c in list(self.st["checkboxes"]):
-            if c.get("phase") in ("done", "deferred"):
-                continue
+        while True:
+            c = next((c for c in self.st["checkboxes"] if c.get("phase") not in ("done", "deferred")), None)
+            if not c:
+                return
             self.reload_config(c)
-            self.process_checkbox(c)
+            if not c.get("dispatch"):  # a boundary: nothing of this checkbox is running on the work tree yet
+                self.boundary_rebase(c["index"])
+            try:
+                self.process_checkbox(c)
+            except Requeue:
+                self.precreate_tasks()
+                continue
             self.start_cumulative(c)
             self.collect_cumulative()
 
@@ -338,7 +356,9 @@ class TicketDriver:
             rows = briefs.tc_rows_text(self.design, tcs) if tcs else ""
             if rows:
                 write_text(os.path.join(work, "tc-rows.md"), rows + "\n")
-            text = briefs.impl(self.cfg, self.design, self.t, box, wt, work, rows, extra=self.fix_extra(c))
+            scene = briefs.ui_scene(self.cfg, self.design, self.t, wt, work, self.goals()) \
+                if self.is_verify(c) and self.cfg.is_ui(self.pkg) else ""
+            text = briefs.impl(self.cfg, self.design, self.t, box, wt, work, rows, extra=self.fix_extra(c) + scene)
         elif kind == "judge":
             text = briefs.judge(self.cfg, self.design, self.t, box, wt, work)
         else:
@@ -349,6 +369,8 @@ class TicketDriver:
         return path
 
     def fix_extra(self, c, review=False):
+        if c.get("fix_source") == "ui_scene":
+            return briefs.scene_fix_extra(c.get("scene_file") or "", review=review)
         if c.get("fix_source") != "integration":
             return ""
         files = [briefs.integration_path(self.work(B.INTEGRATION), r) for r in (self.integ() or {}).get("findings", {})]
@@ -404,6 +426,8 @@ class TicketDriver:
             raise DriverError("사람 승인", f"{key} 는 승인이 필요하다 — cbd {self.cfg.key} approve {self.pkg} {c['index']}")
         self.st.pop("waiting_on", None)
         self.log(f"#{c['index']} 시작 — {c['title'][:70]}")
+        if self.is_verify(c):
+            self.verify_gate(states)
         if c["kind"] == B.DRIVER_VERIFY:
             self.verify_box(c, states)
         elif c["kind"] == B.DRIVER_PIN:
@@ -424,10 +448,12 @@ class TicketDriver:
     def subject(self, c):
         return f"[{self.t.jira}] {c['title']}" if self.t.jira else c["title"]
 
-    def verify_box(self, c, states):
+    def verify_gate(self, states):
         prev = self.t.chain_prev
         if prev and states.get(prev, {}).get("status") not in DONE_STATUSES:
             raise BoxWait([prev], f"첫 verify 는 체인 앞 {prev} verified 뒤 (verify 게이트)")
+
+    def verify_box(self, c, states):
         wt, rc = self.st["worktree"], self.cfg.repo(self.t.repo)
         out, ok = [], True
         tcs = self.t.tcs
@@ -499,6 +525,8 @@ class TicketDriver:
                 c["head_before"] = git(wt, "rev-parse", "HEAD")
                 self.launch(c, "impl")
             self.wait_task(c, "impl")
+        if self.is_verify(c) and self.cfg.is_ui(self.pkg):
+            self.ui_scene(c, work)
         if run(["git", "-C", wt, "diff", "--cached", "--quiet"]).returncode == 0:
             if not self.is_verify(c):
                 raise DriverError("정체", f"{c['index']}번 구현이 스테이지를 남기지 않았다")
@@ -578,6 +606,8 @@ class TicketDriver:
             c["impl_handle"] = w["handle"]
         elif kind == "judge":
             w = self.start_judge(c, retry_of)
+        elif kind == "contract":
+            w = self.start_worker(c, kind, self.cfg["impl"], f"{self.pkg} 실서버 대조", retry_of=retry_of)
         else:
             r = next(r for r in self.cfg["reviewers"] if f"review-{r['name']}" == kind)
             w = self.start_worker(c, kind, r, f"{title} 리뷰 {r['name']}", retry_of=retry_of)
@@ -713,6 +743,251 @@ class TicketDriver:
                 with open(os.path.join(d, name), encoding="utf-8") as f:
                     orca.task_update(rid, m.group(1), "completed", f.read().strip())
                 write_text(os.path.join(d, name + ".sent"), now_iso())
+
+    # ---- 같은 저장소 체인: checkbox-boundary rebase (방식 · 같은 저장소 체인)
+    def nearer(self, new_from, old_from):
+        """Is the verified chain ticket `new_from` nearer to this ticket than `old_from` (None = the repo base)?
+        The same ticket counts as nearer when its verified head moved."""
+        chain = self.design.chains.get(self.t.repo, [])
+        pos = {p: i for i, p in enumerate(chain)}
+        if new_from is None:
+            return False
+        return new_from == old_from or pos.get(new_from, -1) > pos.get(old_from, -1)
+
+    def measure(self, n, label, only=None):
+        """[(name, ok, text)] of the completion tests and the type check on the work tree; `only` limits the names."""
+        wt, rc, out = self.st["worktree"], self.cfg.repo(self.t.repo), []
+        c = {"index": n or 0}
+        if rc.get("test_cmd") and self.t.tcs and (only is None or "test" in only):
+            ok, text = self.run_cmd(rc["test_cmd"], self.t.tcs, wt, c, label)
+            out.append(("test", ok, text))
+        if rc.get("typecheck_cmd") and (only is None or "typecheck" in only):
+            ok, text = self.run_cmd(rc["typecheck_cmd"], [], wt, c, f"{label}-typecheck")
+            out.append(("typecheck", ok, text))
+        return out
+
+    def boundary_rebase(self, n=None):
+        """When a nearer verified chain head than the ticket's base exists (a chain ticket that was in progress at the
+        start is verified now), move the branch onto it before the next checkbox. What was green before the rebase
+        (completion tests, type check) is measured again after it. A conflict or a red run stops the ticket — never
+        resolved by the driver. Returns True when the branch moved."""
+        st = self.st
+        wt, old = st.get("worktree"), st.get("base") or {}
+        if not wt or not st.get("base_sha"):
+            return False
+        states = self.store.all(self.design.order)
+        new, problem = base_for(self.design, states, self.cfg, self.pkg)
+        if problem or not new or not new.get("sha") or new["sha"] == old.get("sha") or \
+                not self.nearer(new.get("from"), old.get("from")):
+            return False
+        if run(["git", "-C", wt, "merge-base", "--is-ancestor", new["sha"], "HEAD"]).returncode == 0:
+            st.update(base=new, base_sha=new["sha"])  # already on it (a restart right after the rebase)
+            self.save()
+            return False
+        dirty = [l for l in git(wt, "status", "--porcelain", "--untracked-files=no").splitlines() if l.strip()]
+        if dirty:
+            raise DriverError("리베이스 충돌", f"체크박스 경계인데 작업 트리가 깨끗하지 않아 {new['from']} 위로 옮기지 못함: "
+                                         f"{', '.join(dirty[:5])}")
+        old_base, head = st["base_sha"], git(wt, "rev-parse", "HEAD")
+        self.log(f"경계 리베이스 — {old.get('from') or old.get('ref')} @{old_base[:10]} → {new['from']} verified 헤드 "
+                 f"@{new['sha'][:10]}")
+        before = self.measure(n, "rebase-before")
+        green = {name for name, ok, _ in before if ok}
+        r = run(["git", "-C", wt, "rebase", "--keep-empty", "--empty=keep", "--onto", new["sha"], old_base], timeout=600)
+        if r.returncode != 0:
+            run(["git", "-C", wt, "rebase", "--abort"])
+            raise DriverError("리베이스 충돌", f"{old_base[:10]}..{head[:10]} 를 {new['from']} verified 헤드 {new['sha'][:10]} "
+                                         f"위로 옮기다 충돌 — 브랜치는 그대로 두었다(abort). 사람이 리베이스한 뒤 resolve: "
+                                         f"{(r.stderr or r.stdout).strip()[-300:]}")
+        olds = git(wt, "rev-list", "--reverse", f"{old_base}..{head}").split()
+        news = git(wt, "rev-list", "--reverse", f"{new['sha']}..HEAD").split()
+        moved = dict(zip(olds, news)) if len(olds) == len(news) else {}
+        if not moved and olds:
+            self.log(f"경고: 리베이스 전후 커밋 수가 다르다 ({len(olds)} → {len(news)}) — 체크박스 커밋 해시를 옮기지 못함")
+        for c in st["checkboxes"]:
+            if c.get("commit") in moved:
+                c["commit"] = moved[c["commit"]]
+        for rec in (st.get("cumulative") or {}).values():
+            if rec.get("phase") == "gated" and rec.get("commit") in moved:
+                rec["commit"] = moved[rec["commit"]]
+        entry = {"at": now_iso(), "from": old, "onto": new, "old_head": head, "new_head": git(wt, "rev-parse", "HEAD"),
+                 "before": [t for _, _, t in before]}
+        st.setdefault("rebases", []).append(entry)
+        st.update(base=new, base_sha=new["sha"])
+        self.save()
+        after = self.measure(n, "rebase-after", only=green) if green else []
+        entry["after"] = [t for _, _, t in after] or ["리베이스 전 초록이던 측정 없음 — 재측정 생략"]
+        self.save()
+        red = [t for _, ok, t in after if not ok]
+        if red:
+            raise DriverError("검증 실패", "경계 리베이스 뒤 재검증 — " + " / ".join(red))
+        self.progress += 1
+        self.log(f"경계 리베이스 완료 {entry['new_head'][:10]} — 재측정: {' / '.join(entry['after'])}")
+        return True
+
+    # ---- 체크박스를 넘는 검증 §1: consumer start against the producer's real server
+    def contract_spec(self):
+        """{"producers", "apis", "source"} of the ticket's 실서버 대조, or None. config contract_checks.<PKG> overrides
+        the design line (false turns it off)."""
+        over = (self.cfg.get("contract_checks") or {}).get(self.pkg)
+        if over is False:
+            return None
+        if over:
+            prods = over.get("producer") or over.get("producers") or []
+            return {"producers": [prods] if isinstance(prods, str) else list(prods), "apis": over.get("apis", ""),
+                    "source": "config"}
+        if self.t.contract:
+            return {**self.t.contract, "source": "design"}
+        return None
+
+    def contract_check(self):
+        """Before the first checkbox: one agent session starts the producer's verified head as an isolated stack and
+        sends real requests to the APIs this ticket consumes. 「일치」 lets the ticket go on; anything else stops it
+        (「계약 불일치」) — the consumer never invents the contract. A resolve checks again from the start."""
+        spec = self.contract_spec()
+        if not spec:
+            return
+        rec = self.st.get("contract") or {}
+        if rec.get("phase") == "done":
+            return
+        if rec.get("phase") in ("mismatch", "failed"):
+            rec = {"previous": rec.get("path")}
+        if not rec:
+            rec = {}
+        rec.setdefault("index", "계약")
+        rec.setdefault("phase", "pending")
+        self.st["contract"] = rec
+        states = self.store.all(self.design.order)
+        need = [p for p in spec["producers"]
+                if states.get(p, {}).get("status") not in DONE_STATUSES or not states.get(p, {}).get("verified_head")]
+        if need:
+            raise BoxWait(need, f"실서버 대조 대상 {', '.join(need)} verified 뒤")
+        work = self.work("contract")
+        path = briefs.contract_path(work)
+        if not (rec.get("done") or {}).get("contract"):
+            if not (rec.get("dispatch") or {}).get("contract"):
+                impl = self.cfg["impl"]
+                rec.setdefault("notes", []).extend(self.gate.wait([impl.get("pool", impl["agent"])], "실서버 대조"))
+                if os.path.exists(path):  # a result of an earlier run must not be read as this one's
+                    os.replace(path, path.replace(".md", f"-{now_ts()}.md"))
+                producers = []
+                for p in spec["producers"]:
+                    pt = self.design.tickets.get(p)
+                    repo = pt.repo if pt else None
+                    producers.append({"package": p, "repo": repo, "head": states[p]["verified_head"],
+                                      "worktree": states[p].get("worktree"), "branch": states[p].get("branch"),
+                                      "stack_cmd": self.cfg["repos"].get(repo or "", {}).get("stack_cmd")})
+                brief = os.path.join(work, "contract-brief.md")
+                write_text(brief, briefs.contract(self.cfg, self.design, self.t, self.st["worktree"], work, spec,
+                                                  producers))
+                if not (rec.get("tasks") or {}).get("contract"):
+                    rec.setdefault("tasks", {})["contract"] = orca.task_create(
+                        self.st["run_id"], f"{self.pkg}#계약 대조 {B.impl_name(self.cfg)}", brief, [])
+                rec.update(phase="running", producers={x["package"]: x["head"] for x in producers},
+                           started_at=now_iso())
+                self.log(f"실서버 대조 시작 — {', '.join(spec['producers'])} verified 헤드, {spec['apis'][:80]}")
+                self.launch(rec, "contract")
+            self.wait_task(rec, "contract", accept_file=path)
+            for d in (rec.get("dispatch") or {}).values():
+                if d:
+                    orca.worker_release(d)
+        verdict = verdict_of(path)
+        rec.update(verdict=verdict, path=path, finished_at=now_iso())
+        if verdict == "일치":
+            rec["phase"] = "done"
+            self.progress += 1
+            self.save()
+            self.log(f"실서버 대조 일치 — {path}")
+            return
+        rec["phase"] = "mismatch" if verdict else "failed"
+        self.save()
+        if verdict == "불일치":
+            raise DriverError("계약 불일치", f"실서버 대조 불일치 ({path}) — 소비자 쪽에서 계약을 맞춰 발명하지 않는다. 생산자를 "
+                                        f"고치거나 설계를 정정한 뒤 cbd {self.cfg.key} resolve {self.pkg} (대조를 다시 한다)")
+        raise DriverError("환경" if verdict else "정체",
+                          f"실서버 대조 {'판단 불가' if verdict else '결과 없음'} ({path}) — 스택·시드를 확인하고 resolve "
+                          "(대조를 다시 한다)")
+
+    # ---- 체크박스를 넘는 검증 §2: one scene of a UI ticket's verify
+    def ui_scene(self, c, work):
+        """Read the implementer's scene result. 일치 (or a person's acceptance) goes on to the commit; 불일치 inserts a
+        fix checkbox before this verify and runs the verify again (Requeue), up to ui_scene_max_fix times; 판단 불가 and
+        mismatches beyond that stop for a person (cbd accept-ui records an acceptance)."""
+        path = briefs.scene_path(work)
+        verdict = verdict_of(path)
+        n = c["index"]
+        if verdict is None:
+            self.reset_box(c, "화면 대조 결과 없음")
+            raise DriverError("정체", f"#{n} verify 가 화면 대조 결과를 남기지 않았다 ({path}) — resolve 하면 verify 를 다시 돈다")
+        c["scene"] = {"verdict": verdict, "path": path}
+        if verdict == "일치":
+            self.save()
+            return
+        acc = self.store.ui_accepted(self.pkg, n)
+        if acc:
+            note = f"\n화면 대조: {verdict} — 사람 수용 ({acc.get('at')} {acc.get('by')}): {acc.get('reason')}\n결과: {path}\n"
+            draft = briefs.paths(work)["draft"]
+            if os.path.exists(draft):
+                with open(draft, encoding="utf-8") as f:
+                    text = f.read()
+                if "사람 수용" not in text:
+                    write_text(draft, text.rstrip("\n") + "\n" + note)
+            c["scene"]["accepted"] = acc
+            self.save()
+            self.log(f"#{n} 화면 대조 {verdict} — 사람 수용 기록으로 진행: {acc.get('reason', '')[:80]}")
+            return
+        if run(["git", "-C", self.st["worktree"], "diff", "--cached", "--quiet"]).returncode != 0:
+            self.reset_box(c, f"화면 대조 {verdict} 인데 스테이지가 있다")
+            raise DriverError("검증 실패", f"#{n} 화면 대조 {verdict} 인데 verify 가 변경을 스테이지했다 — 스테이지를 비우고 resolve")
+        accept = f"cbd {self.cfg.key} accept-ui {self.pkg} {n} '<사유>' 뒤 resolve"
+        if verdict != "불일치":
+            self.reset_box(c, f"화면 대조 {verdict}")
+            raise DriverError("사람 판정", f"#{n} 화면 대조 {verdict} ({path}) — 기준(스냅숏·Figma 링크)을 마련하고 resolve, "
+                                       f"고치지 않고 받아들이려면 {accept}")
+        fixes = [x for x in self.st["checkboxes"] if x.get("fix_source") == "ui_scene" and x.get("fix_for") == n]
+        if len(fixes) >= int(self.cfg.get("ui_scene_max_fix", 2)):
+            self.reset_box(c, "화면 대조 불일치 — 사람 판정 대기")
+            raise DriverError("사람 판정", f"#{n} 화면 대조 불일치가 수정 체크박스 {len(fixes)}개 뒤에도 남았다 ({path}) — "
+                                       f"고칠 수 없는 차이면 {accept}, 더 고치려면 config ui_scene_max_fix 를 올리고 resolve")
+        archived = self.reset_box(c, "화면 대조 불일치 — 수정 체크박스 뒤 다시")
+        m = max(x["index"] for x in self.st["checkboxes"]) + 1
+        title = self.cfg.get("ui_scene_fix_title") or "fix: 화면 대조 불일치 반영"
+        self.st["checkboxes"].insert(self.st["checkboxes"].index(c), {
+            "index": m, "title": title, "phase": "pending", "kind": B.AGENT, "fix_source": "ui_scene", "fix_for": n,
+            "scene_file": archived})
+        self.save()
+        self.log(f"#{n} 화면 대조 불일치 — 수정 체크박스 #{m} 를 verify 앞에 넣고 verify 를 다시 돈다 ({archived})")
+        self.store.alert(self.pkg, "ui_scene", f"#{n} 화면 대조 불일치 — 수정 체크박스 #{m} 로 처리", path=archived)
+        try:
+            self.jira.add_box(self.t.jira, title)
+        except DriverError as e:
+            self.log(f"Jira 체크리스트에 #{m} 추가 실패 — {e.message}")
+        raise Requeue()
+
+    def reset_box(self, c, why):
+        """Put an agent checkbox back to pending: unfinished sessions are closed, the scene result is kept aside under
+        a numbered name (so the next run's result is not confused with it). Returns that archived path."""
+        rid = self.st.get("run_id")
+        for kind, tid in (c.get("tasks") or {}).items():
+            if tid and not (c.get("done") or {}).get(kind):
+                orca.task_update(rid, tid, "completed", f"cbd: 건너뜀 — {why}")
+        for kind, d in (c.get("dispatch") or {}).items():
+            if d and kind != "judge":
+                orca.worker_release(d)
+        if c.get("impl_handle"):
+            orca.terminal_close(c["impl_handle"])
+        work = self.work(c["index"])
+        path, archived = briefs.scene_path(work), ""
+        if os.path.exists(path):
+            k = 1 + sum(1 for f in os.listdir(work) if re.match(r"ui-scene-\d+\.md$", f))
+            archived = os.path.join(work, f"ui-scene-{k}.md")
+            os.replace(path, archived)
+        for k in ("tasks", "dispatch", "done", "retries", "impl_handle", "head_before", "skipped", "notes"):
+            c.pop(k, None)
+        c["phase"] = "pending"
+        c.setdefault("resets", []).append({"at": now_iso(), "why": why, "scene": archived})
+        self.save()
+        return archived
 
     # ---- ticket integration review (체크박스를 넘는 검증 §3)
     def integration_review(self):
@@ -914,6 +1189,15 @@ class TicketDriver:
             self.save()
             self.log(f"미룬 체크박스 {len(deferred)}개만 남음")
             return
+        self.boundary_rebase()
+        prev = self.t.chain_prev
+        if prev and self.store.ticket(prev).get("status") not in DONE_STATUSES:
+            self.st.update(status=REBASE_PENDING, waiting_on=prev, finished_at=now_iso())
+            self.save()
+            self.log(f"체크박스 완료 — 체인 앞 {prev} 가 verified 가 아니라 rebase_pending (verified 되면 스케줄러가 다시 띄워 "
+                     "그 헤드로 리베이스·재검증한 뒤 verified)")
+            return
+        self.st.pop("waiting_on", None)
         base = self.st.get("base_sha")
         n = int(git(wt, "rev-list", "--count", f"{base}..HEAD")) if base else len(done)
         if n != len(done):
@@ -926,6 +1210,12 @@ class TicketDriver:
             self.log(f"Jira 완료 전이 실패 — {e.message}")
         self.log(f"verified {self.st['verified_head'][:10]} — 체크박스 {len(done)}개")
         self.notify(f"{self.pkg} verified")
+
+
+def verdict_of(path):
+    """「판정: 일치 | 불일치 | 판단 불가」 of a scene or contract result's first line, or None."""
+    m = re.match(r"판정\s*[:：]\s*(일치|불일치|판단\s*불가)", _first_line(path) or "")
+    return re.sub(r"\s+", " ", m.group(1)) if m else None
 
 
 def integration_count(path):

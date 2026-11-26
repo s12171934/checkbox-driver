@@ -5,6 +5,7 @@ state/plan.json        the dashboard plan (cbd.plan)
 state/events.json      the last 40 events across tickets
 state/run-<PKG>.json   {run_id, terminal} of the ticket's Orca Run (the dashboard globs run-*.json)
 state/approvals/       <PKG>-<n> files written by `cbd approve`
+state/ui-accept/       <PKG>-<n>.json — a person's acceptance of a UI verify scene mismatch (`cbd accept-ui`)
 state/replies/<run>/   <msg>.question.md from workers, <msg>.md answers to send, task_<id>.complete.md
 state/scheduler.json   the scheduler terminal and the coordinator session that owns the plan
 state/alerts.jsonl     one JSON line per stop or open question (config "alerts": false turns it off)
@@ -89,6 +90,13 @@ class Store:
         os.makedirs(self.p("approvals"), exist_ok=True)
         with open(self.p("approvals", f"{package}-{n}"), "w", encoding="utf-8") as f:
             f.write(f"{now_iso()} {by}\n")
+
+    # ---- UI scene acceptance (체크박스를 넘는 검증 §2: only a person accepts a mismatch)
+    def ui_accepted(self, package, n):
+        return read_json(self.p("ui-accept", f"{package}-{n}.json"))
+
+    def ui_accept(self, package, n, reason, by="user"):
+        write_json(self.p("ui-accept", f"{package}-{n}.json"), {"at": now_iso(), "by": by, "reason": reason})
 
     # ---- runs
     def run_file(self, package):

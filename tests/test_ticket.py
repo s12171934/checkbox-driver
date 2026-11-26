@@ -722,7 +722,8 @@ class TicketTest(unittest.TestCase):
         codex = briefs.integration_review(self.cfg, self.design, t, self.repo, self.home, "codex", "abc", goals)
         claude = briefs.integration_review(self.cfg, self.design, t, self.repo, self.home, "claude", "abc", goals)
         self.assertIn("UI 대조 — Storybook ↔ Figma", codex)
-        self.assertIn("Figma MCP 로 프레임을 직접 조회", codex)  # no snapshot dir -> the Figma file itself
+        self.assertIn("디자인 스냅숏이 아직 없다 — 아래 Figma 링크를 Figma MCP 로 조회해", codex)  # looked up, then saved
+        self.assertIn(os.path.join(FIXTURE, "snapshots", "A1", "index.md"), codex)
         self.assertIn("- https://www.figma.com/design/KEY/x?node-id=1-2", codex)
         self.assertNotIn("UI 대조", claude)
         snap = os.path.join(self.home, "design")

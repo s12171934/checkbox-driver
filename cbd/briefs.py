@@ -11,6 +11,14 @@ Two ticket-level briefs sit beside them (체크박스를 넘는 검증):
   검증 목표 and writes <work>/<PKG>/integration/findings-<name>.md whose first line is 「판정: 지적 없음」 or 「판정: 지적 N」.
 - cumulative check: after every commit, one GPT session checks base..<commit> (git objects only — the next checkbox is
   already changing the work tree) and writes <work>/<PKG>/cumulative/<NN>.md, first line 「판정: 문제 없음」 or 「판정: 문제 N」.
+- contract check (consumer start): before the first checkbox, one session starts the producer's verified head as an
+  isolated stack and sends real requests; <work>/<PKG>/contract/result.md, first line 「판정: 일치|불일치|판단 불가」.
+- UI verify scene: a UI ticket's verify implementer also compares one scene with the design snapshot and writes
+  <work>/<PKG>/<NN>/ui-scene.md, first line 「판정: 일치|불일치|판단 불가」.
+
+Every UI comparison (scene, integration codex) takes the design snapshot first; a frame it lacks is read from the Figma
+link with the Figma MCP and saved into the snapshot folder (<design root>/snapshots/<PKG>/) before it is compared, so
+the next comparison uses the saved snapshot (사용자 결정 2026-11-26).
 """
 
 import os
@@ -56,29 +64,45 @@ def ui_sources(cfg, design, ticket, goals):
     return [d for d in dirs if os.path.isdir(d)], links
 
 
-def ui_compare(cfg, design, ticket, worktree, work, base, goals):
-    """The Storybook ↔ Figma comparison a codex integration reviewer runs on a UI ticket: snapshots first, the Figma
-    file itself (Figma MCP) only when the design has no snapshot for the ticket."""
+def snapshot_dir(cfg, design, package):
+    """Where looked-up Figma frames are saved: the first ui_snapshots pattern under the design root."""
+    pats = cfg.get("ui_snapshots") or ["snapshots/{pkg}"]
+    return os.path.join(design.root, pats[0].format(pkg=package))
+
+
+def snapshot_rules(cfg, design, ticket, goals):
+    """The design-reference rules every UI comparison shares: snapshot first, look up and save what it lacks."""
     snaps, links = ui_sources(cfg, design, ticket, goals)
+    save = snapshot_dir(cfg, design, ticket.package)
+    have = ("디자인 스냅숏(정본) — " + " · ".join(f"`{d}`" for d in snaps)) if snaps else \
+        f"디자인 스냅숏이 아직 없다 — 아래 Figma 링크를 Figma MCP 로 조회해 `{save}/` 에 처음 저장한다"
+    fl = "\n".join(f"  - {u}" for u in links) or "  - (티켓 설계에 Figma 링크가 없다 — 스냅숏에도 없는 화면은 「판단 불가」다)"
+    return f"""- 디자인 기준: {have}.
+- 스냅숏에 없는 프레임·상태만 Figma 링크를 Figma MCP 로 조회한다(`get_screenshot` 그림, `get_design_context`·
+  `get_variable_defs` 치수·색·타이포 값).
+- **조회한 프레임은 대조 전에 스냅숏으로 저장한다** — `{save}/` 에 노드마다 `<노드 id, : 는 ->.png`(그림)와
+  `<노드 id>.md`(프레임 이름 · 링크 · 조회 시각 · 대조에 쓴 값), `{save}/index.md` 표
+  (`| 노드 | 프레임 | 링크 | 조회 시각 | 파일 |`)에 한 줄. 이미 있는 스냅숏 파일은 덮어쓰지 않는다 — 다음 대조부터는 저장된
+  스냅숏이 기준이다. 스냅숏 폴더는 공통 규칙의 쓰기 범위 예외다(워크트리 밖이라 스테이지하지 않는다).
+- 링크도 스냅숏도 없는 화면은 「판단 불가」다.
+- Figma 링크:
+
+{fl}"""
+
+
+def ui_compare(cfg, design, ticket, worktree, work, base, goals):
+    """The Storybook ↔ Figma comparison a codex integration reviewer runs on a UI ticket: snapshots first, frames they
+    lack are looked up with the Figma MCP and saved as snapshots before comparing."""
     rc = cfg["repos"].get(ticket.repo or "", {})
     sb = f"`{' '.join(rc['storybook_cmd'])}`" if rc.get("storybook_cmd") else "저장소의 표준 Storybook 개발 서버 명령"
     out = os.path.join(work, "ui")
-    if snaps:
-        src = "디자인 스냅숏(정본) — " + " · ".join(f"`{d}`" for d in snaps) + \
-              "\n- 스냅숏에 없는 화면·상태만 아래 Figma 링크를 Figma MCP 로 직접 조회한다."
-    else:
-        src = "디자인 스냅숏이 없다 — Figma MCP 로 프레임을 직접 조회한다(`get_screenshot` 으로 그림, `get_design_context`" \
-              "·`get_variable_defs` 로 치수·색·타이포 값)."
-    fl = "\n".join(f"- {u}" for u in links) or "- (티켓 설계에 Figma 링크가 없다 — 스냅숏이 없으면 이 대조는 「판단 불가」 지적이다)"
+    rules = snapshot_rules(cfg, design, ticket, goals)
     return f"""
 ## UI 대조 — Storybook ↔ Figma (codex 리뷰어 몫, UI 티켓)
 
 이 티켓은 화면을 만든다. 코드 리뷰에 더해 **바뀐 화면을 디자인과 하나씩 상세 대조**한다.
 
-- 디자인 기준: {src}
-- Figma 링크:
-
-{fl}
+{rules}
 
 1. `git diff --name-only {base}..HEAD` 에서 바뀐 컴포넌트와 그 스토리(`*.stories.*`)를 고른다. 바뀐 컴포넌트에 스토리가
    없으면 그것도 지적이다.
@@ -180,6 +204,98 @@ def cumulative(cfg, design, ticket, worktree, work, n, title, base, commit, goal
 2. 문제마다 `### <번호>. <한 줄 요약>` — 심각도(차단·중요·사소), 위치(`<커밋>:<파일>:<줄>`), 근거, 어느 체크박스에서
    다뤄야 하는지(남은 체크박스 번호 또는 「수정 체크박스 필요」).
 3. `worker_done` — 결과 경로와 문제 수.
+
+{COMMON.format(**rc)}
+"""
+
+
+def scene_path(work):
+    return os.path.join(work, "ui-scene.md")
+
+
+def ui_scene(cfg, design, ticket, worktree, work, goals):
+    """체크박스를 넘는 검증 §2 — the one-scene comparison a UI ticket's verify implementer adds to the measurement."""
+    rc = cfg["repos"].get(ticket.repo or "", {})
+    sb = f"`{' '.join(rc['storybook_cmd'])}`" if rc.get("storybook_cmd") else "저장소의 표준 Storybook 개발 서버 명령"
+    out = scene_path(work)
+    return f"""
+## 화면 한 장면 대조 (UI 티켓 verify)
+
+측정(완료 기준 테스트·타입 검사)에 더해 **이 티켓이 만든 화면 한 장면을 디자인과 대조**한다. 코드를 고치지 않는다 —
+불일치는 드라이버가 verify 앞에 수정 체크박스를 넣어 고친 뒤 이 verify 를 다시 돌린다.
+
+{snapshot_rules(cfg, design, ticket, goals)}
+
+1. 장면 하나를 고른다 — 티켓 설계 「Figma 대조 프레임」의 첫 프레임, 없으면 검증 목표가 가리키는 대표 화면.
+   공용 UI 라이브러리 저장소면 그 스토리를 이 워크트리에서 {sb} 로 **비어 있는 포트**에 띄우고(끝나면 끈다), 앱 저장소면
+   격리 스택의 실화면(시드 계정)을 연다.
+2. 캡처를 `{os.path.join(work, 'ui')}/` 에 남기고 프레임과 대조한다 — 크기·여백·간격, 색(토큰과 값), 타이포, 모서리·그림자·테두리,
+   아이콘, 문구, 상태.
+3. `{out}` 의 **첫 줄**을 정확히 `판정: 일치` · `판정: 불일치` · `판정: 판단 불가` 중 하나로 쓰고, 그 아래 표
+   `| 화면 | 프레임(링크·노드 id 또는 스냅숏 파일) | 캡처 | 차이 |`. 불일치면 차이마다 위치(`파일:줄`)와 고칠 방향을 적는다.
+4. 불일치·판단 불가면 아무것도 스테이지하지 않는다. 고칠 수 없어 보이는 차이(시안끼리 모순 등)도 「사람 판정 필요」로 적기만
+   한다 — 스스로 수용하지 않는다(수용은 사람이 `cbd accept-ui` 로만 한다).
+5. 일치면 커밋 메시지 초안 본문에 `화면 대조: 일치 — {out}` 한 줄을 넣는다.
+"""
+
+
+def scene_fix_extra(scene_file, review=False):
+    what = ("스테이지된 변경이 아래 화면 대조 결과의 불일치를 모두 고쳤는지도 본다. 빠진 차이는 결함으로 적는다." if review else
+            "아래 화면 대조 결과(verify 의 한 장면 대조)의 불일치를 모두 이 커밋 하나로 고친다. 디자인 기준은 결과 파일이 가리킨"
+            " 스냅숏·프레임이다. 기존 커밋을 고쳐 쓰지 않는다 — 수정은 이 체크박스의 새 커밋이다.")
+    return f"""
+## 이 체크박스는 UI verify 화면 대조 불일치의 수정이다
+
+{what}
+
+- `{scene_file or '(결과 파일 없음)'}`
+"""
+
+
+def contract_path(work):
+    return os.path.join(work, "result.md")
+
+
+def contract(cfg, design, ticket, worktree, work, spec, producers):
+    """체크박스를 넘는 검증 §1 — the consumer start check against the producer's verified head on an isolated stack."""
+    rc = {"pkg": ticket.package, "jira": ticket.jira or "(Jira 없음)", "worktree": worktree, "branch": ticket.branch,
+          "work": work, "test_hint": "이 대조에서는 테스트를 돌리지 않는다 — 격리 스택은 아래 1번대로만 띄운다"}
+    out = contract_path(work)
+    rows = []
+    for p in producers:
+        stack = f"`{' '.join(p['stack_cmd'])}`" if p.get("stack_cmd") else "생산자 저장소의 표준 서버 기동 방법"
+        rows.append(f"- {p['package']} (`{p['repo'] or '?'}`) verified 헤드 `{p['head']}` — 워크트리 `{p['worktree'] or '(없음)'}`"
+                    f" (브랜치 `{p['branch'] or '?'}`), 스택 기동 {stack}")
+    records = (cfg.get("vault") or {}).get("records_dir") or ""
+    note = (f"\n5. 볼트 `{records}` 에 대조 기록 노트를 쓴다 — 프론트매터(title·created·updated·tags·source: ai), 생산자·헤드·"
+            f"API·판정·불일치 근거. 경로를 `{os.path.join(work, 'record-path.txt')}` 에 한 줄로 적는다.") if records else ""
+    return f"""# {rc['pkg']} 소비자 착수 실서버 대조
+
+티켓 {rc['pkg']} ({rc['jira']}) 는 다른 저장소 티켓(생산자)이 만든 서버 계약을 소비한다. 첫 구현 체크박스 전에 **생산자의
+verified 헤드를 격리 스택으로 띄워**, 이 티켓이 소비할 API 가 설계대로 응답하는지 실제 요청으로 확인한다. 생산자 테스트가
+그린이라는 사실로 갈음하지 않는다.
+
+## 대조 대상
+
+{chr(10).join(rows)}
+- API: {spec.get('apis') or '(설계에 API 이름이 없다 — 이 티켓 절이 소비하는 API 전부)'}
+- 계약 정본: 설계 루트 `{design.root}` 에서 위 API 의 계약 절(요청 파라미터 · 응답 필드 · 타입 · 에러 코드). 이 티켓의 설계:
+
+{ticket.index_section or "(ticket-index 절 없음)"}
+
+## 할 일
+
+1. 생산자 워크트리의 `HEAD` 가 위 verified 헤드와 같은지 먼저 확인한다(다르면 「판단 불가」). 그 워크트리에서 서버를
+   **격리 스택**으로 띄운다 — 비어 있는 포트, 이 대조 전용 DB(이름에 `{rc['pkg'].lower()}-contract`), E2E 스택·다른 티켓 스택과
+   포트·DB 를 나눠 쓴다. 공유 DB·스택에 붙지 않는다. 시드는 생산자 저장소의 시드·팩토리로 만든다. 생산자 워크트리의
+   추적 파일은 고치지 않는다.
+2. API 마다 설계의 정상 요청과 설계에 적힌 오류 요청(필수 파라미터 누락 · 권한 밖 등)을 실제로 보내고 응답(상태 코드 · 필드 ·
+   타입 · 값)을 계약과 대조한다.
+3. `{out}` 의 **첫 줄**을 정확히 `판정: 일치` · `판정: 불일치` · `판정: 판단 불가`(스택을 띄우지 못함 등) 중 하나로 쓰고,
+   아래 표 `| API | 요청 | 계약(설계) | 실제 응답 | 판정 |` 와 불일치마다 근거(요청·응답 원문 발췌)를 적는다.
+4. 스택을 끄고 대조 전용 DB 를 지운다. 어느 워크트리에도 코드를 고치거나 커밋하지 않는다 — 불일치를 소비자 쪽에서 맞춰
+   발명하지 않는다.{note}
+6. `worker_done` — 결과 경로와 판정.
 
 {COMMON.format(**rc)}
 """

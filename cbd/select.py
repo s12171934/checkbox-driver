@@ -2,12 +2,15 @@
 
 Rules (티켓 체크박스 커밋 리뷰 방식 · 같은 저장소 체인):
 - A ticket starts when every DAG predecessor (ticket-index 「선행」) is verified — chain order alone never blocks it.
-  With `chain_serial` it also waits for its chain prev, so it always starts on that ticket's verified head (the driver
-  has no boundary rebase; without it, chain tickets started together each start on the repo base).
+  With `chain_serial` it also waits for its chain prev, so it always starts on that ticket's verified head and never
+  needs the boundary rebase. Without it a ticket may start on a farther verified head (or the repo base) and the ticket
+  driver moves it onto a nearer chain head at a checkbox boundary once one is verified (cbd.ticket boundary_rebase).
   `start_waived` lists predecessors a ticket does not wait for.
 - Its base is the verified head of the nearest verified ticket before it in its repo chain, else the repo base.
   It never starts on top of an in-progress branch.
 - verified tickets must be a prefix of each chain; a gap stops the scheduler for that chain.
+- A `rebase_pending` ticket (finished before its chain prev was verified) is launched again once the chain prev is
+  verified: its driver rebases onto that head, measures again and only then marks it verified.
 - Held tickets (`hold`) start only through `cbd launch`.
 - A branchless verification ticket (single-doc 「—」 branch) is never started, not even by `cbd launch`: a person does
   its checks. Its dependents wait for it until the person lists it in their `start_waived`.
@@ -96,7 +99,21 @@ def select(design, states, cfg, alive=frozenset(), forced=()):
             out.append(Candidate(pkg, False, "브랜치 없는 검증 티켓 — 드라이버가 몰지 않는다(사람이 확인)", label))
             continue
         if status in DONE_STATUSES:
-            out.append(Candidate(pkg, False, "완료" if status != REBASE_PENDING else "리베이스 대기", label))
+            out.append(Candidate(pkg, False, "완료", label))
+            continue
+        if status == REBASE_PENDING:
+            prev = t.chain_prev
+            if prev and states.get(prev, {}).get("status") not in DONE_STATUSES:
+                out.append(Candidate(pkg, False, f"리베이스 대기: 체인 앞 {prev} verified 뒤", label))
+            elif pkg in live:
+                out.append(Candidate(pkg, False, "실행 중", label))
+            elif seconds_since(st.get("launched_at")) < int(cfg["launch_cooldown_sec"]) and pkg not in forced:
+                out.append(Candidate(pkg, False, "기동 직후", label))
+            elif slots <= 0 and pkg not in forced:
+                out.append(Candidate(pkg, False, f"기동 대기 (동시 상한 {limit})", label))
+            else:
+                out.append(Candidate(pkg, True, f"체인 앞 {prev} verified — 리베이스·재검증", label, st.get("base")))
+                slots -= 1
             continue
         if status == MANUAL:
             out.append(Candidate(pkg, False, "수동 진행", label))

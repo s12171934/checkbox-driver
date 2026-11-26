@@ -130,6 +130,22 @@ def goals_in(text):
     return []
 
 
+CONTRACT_RE = re.compile(r"^\s*(?:[-*]\s+)?\**실서버 대조\**\s*[:：]\s*(.+?)\s*$")
+
+
+def contract_in(text):
+    """A 「실서버 대조: R1 — M4 · M5 (§7)」 line -> {"producers": [R1], "apis": "M4 · M5 (§7)"} (None without one).
+    The packages before the dash are the producers whose verified head is checked; the rest names the APIs."""
+    for line in text.splitlines():
+        m = CONTRACT_RE.match(line)
+        if not m or m.group(1).strip() in DASH:
+            continue
+        parts = re.split(r"\s+(?:—|--|-)\s+", m.group(1), maxsplit=1)
+        head, apis = parts[0], (parts[1] if len(parts) > 1 else "")
+        return {"producers": packages_in(head), "apis": (apis or m.group(1)).strip()}
+    return None
+
+
 def strip_md(cell):
     cell = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", cell)
     return cell.replace("`", "").strip()
@@ -188,6 +204,7 @@ class Ticket:
         self.index_section = ""   # the ticket's ### section of ticket-index.md (읽을 노드 목록) — goes into briefs
         self.index_tests = ""     # its 「테스트:」 line, the fallback when order.md has no 완료 기준
         self.goals = []           # 「검증 목표:」 items — what the ticket integration review checks the branch against
+        self.contract = None      # 「실서버 대조:」 {"producers", "apis"} — the consumer start check (체크박스를 넘는 검증 §1)
         self.tcs = []
         self.verification_only = False  # single-doc 「—」 branch: a checklist of checks, not commits — never driven
         self.chain_position = 0
@@ -398,9 +415,11 @@ class Design:
                     self.ticket(current)
         for k, (pkg, s) in enumerate(starts):  # 검증 목표 lists sit between a ticket's line and the next one's
             region = lines[s + 1:starts[k + 1][1] if k + 1 < len(starts) else len(lines)]
-            goals = goals_in("\n".join(l for l in region if not l.strip().startswith("```") and not re.match(r"^\s*\[[ xX]\]", l)))
+            text = "\n".join(l for l in region if not l.strip().startswith("```") and not re.match(r"^\s*\[[ xX]\]", l))
+            goals = goals_in(text)
             if goals:
                 self.tickets[pkg].goals = goals
+            self.tickets[pkg].contract = contract_in(text) or self.tickets[pkg].contract
         return blocks, heading
 
     # ---- plan/ticket-index.md
@@ -446,6 +465,7 @@ class Design:
             tm = re.search(r"^- 테스트:\s*(.+)$", body, re.M)
             t.index_tests = tm.group(1).strip() if tm else ""
             t.goals = goals_in(body)
+            t.contract = contract_in(body)
 
     # ---- plan/jira-map.md
     def _read_jira_map(self):
@@ -530,6 +550,11 @@ class Design:
             for d in t.predecessors:
                 if d not in self.tickets:
                     self.warnings.append(f"{t.package}: 선행 {d} 가 계획에 없다")
+            if t.contract:
+                bad = [p for p in t.contract["producers"] if p not in self.tickets or p == t.package]
+                if bad or not t.contract["producers"]:
+                    self.warnings.append(f"{t.package}: 실서버 대조의 생산자 {', '.join(bad) or '(없음)'} 가 계획에 없다 "
+                                         "(「실서버 대조: <생산자> — <API>」)")
 
     # ---- tests/*.md
     def tc_rows(self):

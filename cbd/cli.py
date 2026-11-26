@@ -9,6 +9,7 @@
   launch    <PKG>                                  launch one ticket now (held / blocked / waiting predecessors too)
   run       <PKG>                                  the ticket driver itself (runs inside the launched terminal)
   approve   <PKG> <n>                              human approval for checkbox n
+  accept-ui <PKG> <n> <사유>                        a person accepts the UI verify scene mismatch of checkbox n
   resolve   <PKG>                                  close a ticket's open exceptions so the scheduler may relaunch it
   defer     <PKG> <n>                              skip checkbox n for now (the ticket stops on box_deferred at the end)
 """
@@ -86,6 +87,12 @@ def cmd_check(a):
         drv = sum(1 for k in kinds if k != B.AGENT)
         print(f"  {pkg:4} {t.jira or '-':10} {t.branch or '(브랜치 없음)':40} 선행 {','.join(t.predecessors) or '-':12} "
               f"체크박스 {len(t.boxes)} (드라이버 {drv}) TC {len(t.tcs)} 검증 목표 {len(t.goals)}")
+        over = (cfg.get("contract_checks") or {}).get(pkg)
+        contract = None if over is False else (over or t.contract)
+        if contract:
+            prods = contract.get("producer") or contract.get("producers") or []
+            prods = [prods] if isinstance(prods, str) else prods
+            print(f"       실서버 대조: {', '.join(prods)} — {contract.get('apis', '')}{' (config)' if over else ''}")
     for w in design.warnings:
         print(f"  ! {w}")
     for n in design.notices:  # reported, not a failure: the ticket still runs
@@ -266,6 +273,16 @@ def cmd_approve(a):
     print(f"{a.package}#{a.n} 승인 — 멈춰 있었다면 cbd {a.key} resolve {a.package}")
 
 
+def cmd_accept_ui(a):
+    cfg, design, store = load(a.key)
+    reason = " ".join(a.reason).strip()
+    if not reason:
+        raise SystemExit("수용 사유가 필요하다")
+    store.ui_accept(a.package, a.n, reason, by=os.environ.get("ORCA_TERMINAL_HANDLE") or "user")
+    store.event(a.package, f"#{a.n} 화면 대조 불일치 사람 수용 — {reason[:80]}")
+    print(f"{a.package}#{a.n} 화면 대조 수용 기록 — 멈춰 있었다면 cbd {a.key} resolve {a.package}")
+
+
 def cmd_resolve(a):
     cfg, design, store = load(a.key)
     st = store.ticket(a.package)
@@ -310,8 +327,12 @@ def main(argv=None):
         s = sub.add_parser(name)
         s.add_argument("package")
         s.add_argument("n", type=int)
+    s = sub.add_parser("accept-ui")
+    s.add_argument("package")
+    s.add_argument("n", type=int)
+    s.add_argument("reason", nargs="+")
     a = ap.parse_args(argv)
-    fn = globals()[f"cmd_{a.cmd}"]
+    fn = globals()[f"cmd_{a.cmd.replace('-', '_')}"]
     try:
         return fn(a) or 0
     except DriverError as e:
